@@ -1,0 +1,123 @@
+# ====================
+# Novel Studio2 .gitignore
+# ====================
+
+# ====================
+# 用户数据（包含小说内容，不提交）
+# ====================
+data/
+小说样本/
+*.tmp
+
+# ====================
+# 配置文件（可能包含 API Key）
+# ====================
+config.yaml
+API说明.md
+.env
+.env.*
+
+# ====================
+# Python
+# ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 虚拟环境
+venv/
+.venv/
+ENV/
+env/
+
+# ====================
+# IDE / 编辑器
+# ====================
+
+# VS Code
+.vscode/
+
+# JetBrains (PyCharm, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+
+# ====================
+# 操作系统
+# ====================
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ====================
+# 日志
+# ====================
+*.log
+logs/
+
+# ====================
+# 测试 / 覆盖率
+# ====================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ====================
+# 文档构建
+# ====================
+docs/_build/
+site/
+
+# ====================
+# 临时文件
+# ====================
+*.bak
+*.swp
+*.tmp
+temp/
+tmp/
