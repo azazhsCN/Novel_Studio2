@@ -65,7 +65,7 @@
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/azazhsCN/Novel_Studio2.git
 cd Novel_Studio2
 
 # 安装依赖
