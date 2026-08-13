@@ -1,6 +1,7 @@
 """章节规划模块"""
 import json
 import uuid
+from fastapi import HTTPException
 from app.core.api_client import api_client
 from app.core.prompt_builder import build_planning_prompt
 from app.models.novel import NovelProject
@@ -17,6 +18,12 @@ async def generate_plan(project: NovelProject, last_chapter_content: str,
 
     response = await api_client.chat(prompt)
     data = _extract_json(response)
+
+    # 解析失败或章节列表为空时绝不保存空规划，直接报错
+    if data.get("error"):
+        raise HTTPException(502, f"规划生成失败：AI响应无法解析，请重试。原因: {data.get('error')}")
+    if not data.get("chapters"):
+        raise HTTPException(502, "规划生成失败：AI响应中缺少章节列表，请重试")
 
     # 构建规划对象
     chapters = []

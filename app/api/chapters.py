@@ -2,7 +2,7 @@
 import json as json_module
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from app.models.novel import NovelProject
 from app.models.chapter import ChapterBatchPlan, ChapterPlanItem, Chapter
@@ -11,8 +11,8 @@ router = APIRouter(prefix="/api/novels/{novel_id}/chapters", tags=["chapters"])
 
 
 class PlanGenerateRequest(BaseModel):
-    start_chapter: int
-    num_chapters: int = 10
+    start_chapter: int = Field(ge=1, le=100000)
+    num_chapters: int = Field(default=10, ge=1, le=100)
     direction_hint: str = ""
 
 
@@ -23,7 +23,7 @@ class PlanUpdateRequest(BaseModel):
 class ChapterPlanEditRequest(BaseModel):
     title: Optional[str] = None
     chapter_type: Optional[str] = None
-    word_count_target: Optional[int] = None
+    word_count_target: Optional[int] = Field(default=None, ge=100, le=100000)
     time: Optional[str] = None
     scene: Optional[str] = None
     core_plot: Optional[list[str]] = None
@@ -401,8 +401,14 @@ async def write_chapter_stream(novel_id: str, req: WriteRequest):
     style_sample = req.style_sample or load_style_sample(novel_id)
 
     async def event_generator():
-        async for event in do_write_stream(project, chapter_plan, last_content, style_sample):
-            yield f"data: {json_module.dumps(event, ensure_ascii=False)}\n\n"
+        try:
+            async for event in do_write_stream(project, chapter_plan, last_content, style_sample):
+                yield f"data: {json_module.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            # 流中途异常必须显式告知前端（否则前端会把断连当作正常结束）
+            import logging
+            logging.getLogger(__name__).error(f"流式写作中断: {e}", exc_info=True)
+            yield f"data: {json_module.dumps({'type': 'error', 'message': f'生成中断: {e}'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -435,8 +441,14 @@ async def revise_chapter_stream(novel_id: str, chapter_number: int, req: ReviseR
     from app.core.writer import revise_chapter_stream as do_revise_stream
 
     async def event_generator():
-        async for event in do_revise_stream(project, chapter, req.revision意见, chapter_plan):
-            yield f"data: {json_module.dumps(event, ensure_ascii=False)}\n\n"
+        try:
+            async for event in do_revise_stream(project, chapter, req.revision意见, chapter_plan):
+                yield f"data: {json_module.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            # 流中途异常必须显式告知前端（否则前端会把断连当作正常结束）
+            import logging
+            logging.getLogger(__name__).error(f"流式修改中断: {e}", exc_info=True)
+            yield f"data: {json_module.dumps({'type': 'error', 'message': f'修改中断: {e}'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),

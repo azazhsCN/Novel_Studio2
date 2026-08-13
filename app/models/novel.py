@@ -2,8 +2,12 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 import json
+import logging
 from pathlib import Path
 from app.core.config import get_novel_dir, get_novel_subdirs, DATA_DIR
+from app.core.storage import backup_file, move_to_trash, quarantine_corrupt_file
+
+logger = logging.getLogger(__name__)
 
 
 class CharacterCard(BaseModel):
@@ -65,6 +69,8 @@ class NovelProject(BaseModel):
         path = get_novel_dir(self.id) / "project.json"
         tmp = path.with_suffix('.json.tmp')
         tmp.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        if path.exists():
+            backup_file(path)  # 覆盖前保留历史版本
         tmp.replace(path)
 
     @classmethod
@@ -82,16 +88,22 @@ class NovelProject(BaseModel):
         for d in DATA_DIR.iterdir():
             if d.is_dir() and d.name.startswith("novel_"):
                 pid = d.name[6:]  # remove "novel_" prefix
-                p = cls.load(pid)
+                try:
+                    p = cls.load(pid)
+                except Exception as e:
+                    # 单个项目损坏不拖垮整个列表：隔离坏文件并记录日志
+                    logger.error(f"项目 {pid} 的 project.json 损坏，已隔离: {e}")
+                    quarantine_corrupt_file(d / "project.json")
+                    continue
                 if p:
                     projects.append(p)
         return sorted(projects, key=lambda x: x.updated_at, reverse=True)
 
     def delete(self):
-        import shutil
+        """删除项目：移入回收站而非直接删除，可手动恢复"""
         path = get_novel_dir(self.id)
         if path.exists():
-            shutil.rmtree(path)
+            move_to_trash(path, DATA_DIR / ".trash")
 
     def get_word_count(self, chapter_type: str) -> int:
         """根据章节类型返回目标字数"""

@@ -1,6 +1,7 @@
 """审计系统模块
 负责资源追踪、冲突检测、审计报告生成
 """
+from fastapi import HTTPException
 from app.core.api_client import api_client
 from app.core.prompt_builder import build_audit_prompt
 from app.core.importer import _extract_json
@@ -17,6 +18,10 @@ async def audit_chapter(project: NovelProject, chapter: Chapter) -> dict:
     prompt = build_audit_prompt(project, chapter.content, chapter.chapter_number, resource_summary)
     response = await api_client.chat(prompt)
     result = _extract_json(response)
+
+    # 解析失败不能当作"无冲突"：审计的失败方向必须显式报错
+    if result.get("error"):
+        raise HTTPException(502, f"审计失败：AI响应无法解析，请重试。原因: {result.get('error')}")
 
     # 处理冲突
     conflicts = []

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Novel Studio2 - 小说写作工作台</title>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@18.0.9/lib/marked.umd.js" integrity="sha384-kyb7rY2xnKgiRpRdAeNJxQ8e2SiGZy1m+FK9yME6M0eGJpg7EFaGGvf7+JSirgqE" crossorigin="anonymous"></script>
 <style>
 :root {
     --bg: #1a1a2e;
@@ -158,11 +158,11 @@ select.form-control { appearance:none; }
     <div class="sidebar">
         <div class="sidebar-header">
             <h2>Novel Studio2</h2>
-            <div style="font-size:12px;color:var(--text2);margin-top:4px;">小说写作工作台 ver26.6.3</div>
+            <div style="font-size:12px;color:var(--text2);margin-top:4px;">小说写作工作台 ver26.8.13</div>
         </div>
         <div class="novel-list" id="novelList"></div>
         <div class="sidebar-footer">
-            <button class="btn btn-primary btn-block" onclick="showCreateNovel()">+ 新建小说项目</button>
+            <button class="btn btn-primary btn-block" data-action="showCreateNovel">+ 新建小说项目</button>
         </div>
     </div>
 
@@ -186,7 +186,7 @@ select.form-control { appearance:none; }
     <div class="modal">
         <div class="modal-header">
             <span id="modalTitle">标题</span>
-            <button class="btn btn-sm btn-secondary" onclick="closeModal()">&times;</button>
+            <button class="btn btn-sm btn-secondary" data-action="closeModal">&times;</button>
         </div>
         <div class="modal-body" id="modalBody"></div>
         <div class="modal-footer" id="modalFooter"></div>
@@ -211,6 +211,23 @@ let novels = [];
 function escapeHtml(str) {
     if (str == null) return '';
     return String(str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;');
+}
+
+function renderMarkdown(md) {
+    // marked 不消毒输出：内容已由调用方 escapeHtml，这里再过滤 javascript:/data: 链接，
+    // 防止 LLM 输出中的 markdown 链接语法变成可点击的恶意链接
+    let html;
+    if (typeof marked !== 'undefined' && marked.parse) {
+        try {
+            html = marked.parse(md);
+        } catch (e) { html = escapeHtml(md).replace(/\n/g, '<br>'); }
+    } else {
+        // marked 未加载（离线/CDN失败）：降级为纯文本
+        html = escapeHtml(md).replace(/\n/g, '<br>');
+    }
+    return String(html)
+        .replace(/(<a\s[^>]*href=["'])javascript:[^"']*(["'])/gi, '$1#$2')
+        .replace(/(<a\s[^>]*href=["'])data:[^"']*(["'])/gi, '$1#$2');
 }
 
 // ========== API ==========
@@ -246,22 +263,39 @@ async function apiStream(path, options, onToken, onDone) {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let gotDone = false;
 
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                try {
-                    const event = JSON.parse(line.slice(6));
-                    if (event.type === 'token' && onToken) onToken(event.content);
-                    else if (event.type === 'done' && onDone) onDone(event.chapter);
-                } catch (e) {}
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                let event;
+                try { event = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                if (event.type === 'token' && onToken) onToken(event.content);
+                else if (event.type === 'done' && onDone) { gotDone = true; onDone(event.chapter); }
+                else if (event.type === 'error') throw new Error(event.message || '生成中断');
             }
         }
+        // 冲刷解码器残留，处理末行无换行符的最后一条事件
+        const tail = decoder.decode() + buffer;
+        if (tail.startsWith('data: ')) {
+            let event;
+            try { event = JSON.parse(tail.slice(6)); } catch (e) { event = null; }
+            if (event && event.type === 'done' && onDone) { gotDone = true; onDone(event.chapter); }
+            else if (event && event.type === 'error') throw new Error(event.message || '生成中断');
+        }
+    } catch (e) {
+        reader.cancel().catch(() => {});
+        throw e;
+    }
+    if (!gotDone) {
+        // 连接关闭但未收到完成事件：视为中断失败，避免界面永久锁死在"生成中"
+        throw new Error('生成中断：连接意外关闭');
     }
 }
 
@@ -312,7 +346,7 @@ function renderNovelList() {
         return;
     }
     el.innerHTML = novels.map(n => `
-        <div class="novel-item ${n.id === currentNovelId ? 'active' : ''}" onclick="selectNovel('${escapeHtml(n.id)}')">
+        <div class="novel-item ${n.id === currentNovelId ? 'active' : ''}" data-action="selectNovel" data-novel-id="${escapeHtml(n.id)}">
             <div class="title">${escapeHtml(n.title)}</div>
             <div class="meta">已定稿 ${n.total_finalized} 章 | 待写 ${n.total_planned} 章</div>
         </div>
@@ -320,25 +354,30 @@ function renderNovelList() {
 }
 
 // ========== Select Novel ==========
+let novelSwitchToken = 0;  // 切换序号：防止慢响应覆盖当前小说界面
+
 async function selectNovel(id) {
     currentNovelId = id;
     renderNovelList();
-    await loadNovelDashboard(id);
+    const token = ++novelSwitchToken;
+    await loadNovelDashboard(id, token);
 }
 
 // ========== Novel Dashboard ==========
-async function loadNovelDashboard(novelId) {
+async function loadNovelDashboard(novelId, token) {
     const header = document.getElementById('mainHeader');
     const content = document.getElementById('mainContent');
 
     try {
         const novel = await api(`/api/novels/${novelId}`);
+        // 竞态保护：等待期间用户已切换到别的小说，则丢弃本次渲染
+        if (token !== undefined && token !== novelSwitchToken) return;
         header.innerHTML = `
             <span style="font-size:18px;font-weight:600;">${escapeHtml(novel.title)}</span>
             <div>
-                <button class="btn btn-sm btn-secondary" onclick="showImportModal()">导入小说</button>
-                <button class="btn btn-sm btn-secondary" onclick="showEditNovelModal()">设置</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteNovel('${escapeHtml(novelId)}')">删除</button>
+                <button class="btn btn-sm btn-secondary" data-action="showImportModal">导入小说</button>
+                <button class="btn btn-sm btn-secondary" data-action="showEditNovelModal">设置</button>
+                <button class="btn btn-sm btn-danger" data-action="deleteNovel" data-novel-id="${escapeHtml(novelId)}">删除</button>
             </div>
         `;
 
@@ -361,18 +400,18 @@ async function loadNovelDashboard(novelId) {
 
             <!-- Tabs -->
             <div class="tabs">
-                <div class="tab active" onclick="switchTab(this, 'tab-plans')">章节规划</div>
-                <div class="tab" onclick="switchTab(this, 'tab-writing')">写作工作台</div>
-                <div class="tab" onclick="switchTab(this, 'tab-chapters')">已写章节</div>
-                <div class="tab" onclick="switchTab(this, 'tab-prompt')">核心提示词</div>
-                <div class="tab" onclick="switchTab(this, 'tab-audit')">审计系统</div>
-                <div class="tab" onclick="switchTab(this, 'tab-samples')">文风样本</div>
+                <div class="tab active" data-action="switchTab" data-tab="tab-plans">章节规划</div>
+                <div class="tab" data-action="switchTab" data-tab="tab-writing">写作工作台</div>
+                <div class="tab" data-action="switchTab" data-tab="tab-chapters">已写章节</div>
+                <div class="tab" data-action="switchTab" data-tab="tab-prompt">核心提示词</div>
+                <div class="tab" data-action="switchTab" data-tab="tab-audit">审计系统</div>
+                <div class="tab" data-action="switchTab" data-tab="tab-samples">文风样本</div>
             </div>
 
             <!-- Tab: Plans -->
             <div id="tab-plans" class="tab-content">
                 <div style="margin-bottom:16px;display:flex;gap:8px;">
-                    <button class="btn btn-primary" onclick="showGeneratePlanModal()">+ AI生成规划</button>
+                    <button class="btn btn-primary" data-action="showGeneratePlanModal">+ AI生成规划</button>
                 </div>
                 <div id="plansList"><div class="loading"><span class="spinner"></span> 加载中...</div></div>
             </div>
@@ -387,7 +426,7 @@ async function loadNovelDashboard(novelId) {
             <!-- Tab: Chapters -->
             <div id="tab-chapters" class="tab-content" style="display:none;">
                 <div style="margin-bottom:16px;display:flex;gap:8px;align-items:center;">
-                    <button class="btn btn-primary" onclick="exportAllChapters()">导出全部章节</button>
+                    <button class="btn btn-primary" data-action="exportAllChapters">导出全部章节</button>
                     <span style="color:var(--text2);font-size:13px;">导出已定稿章节（无定稿则导出全部）</span>
                 </div>
                 <div id="chaptersList"><div class="loading"><span class="spinner"></span> 加载中...</div></div>
@@ -408,14 +447,14 @@ async function loadNovelDashboard(novelId) {
             <div id="tab-samples" class="tab-content" style="display:none;">
                 <div style="margin-bottom:16px;">
                     <input type="file" id="styleFile" accept=".txt" style="display:none" onchange="uploadStyleSample(this)">
-                    <button class="btn btn-primary" onclick="document.getElementById('styleFile').click()">上传文风样本</button>
+                    <button class="btn btn-primary" data-action="openStyleFilePicker">上传文风样本</button>
                 </div>
                 <div id="samplesList"><div class="loading"><span class="spinner"></span> 加载中...</div></div>
             </div>
         `;
 
         // Load first tab data
-        loadPlans();
+        loadPlans(novelId);
     } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -435,10 +474,12 @@ function switchTab(el, tabId) {
 }
 
 // ========== Plans ==========
-async function loadPlans() {
+async function loadPlans(novelId) {
+    // 优先用调用方传入的 novelId，避免切换小说后读到全局 currentNovelId 的新值
+    const nid = novelId || currentNovelId;
     const el = document.getElementById('plansList');
     try {
-        const data = await api(`/api/novels/${currentNovelId}/chapters/plans`);
+        const data = await api(`/api/novels/${nid}/chapters/plans`);
         if (!data.plans.length) {
             el.innerHTML = '<div style="text-align:center;color:var(--text2);padding:40px;">暂无章节规划，点击上方按钮生成</div>';
             return;
@@ -448,7 +489,7 @@ async function loadPlans() {
             html += `<div class="card"><div class="card-header">
                 <span>第${plan.start_chapter}-${plan.end_chapter}章规划</span>
                 <div>
-                    <button class="btn btn-sm btn-danger" onclick="deletePlan('${plan.id}')">删除</button>
+                    <button class="btn btn-sm btn-danger" data-action="deletePlan" data-plan-id="${escapeHtml(plan.id)}">删除</button>
                 </div>
             </div><div class="card-body">`;
             if (plan.direction_hint) {
@@ -464,16 +505,16 @@ async function loadPlans() {
                     <td><span class="badge ${badge}">${typeLabel}</span></td>
                     <td>${ch.word_count_target}字</td>
                     <td>
-                        <button class="btn btn-sm btn-secondary" onclick="viewPlanDetail('${plan.id}', ${ch.chapter_number})">查看</button>
-                        <button class="btn btn-sm btn-primary" onclick="switchToWritingForChapter(${ch.chapter_number})">去写作</button>
-                        <button class="btn btn-sm btn-danger" onclick="deletePlanChapter('${plan.id}', ${ch.chapter_number})">删除</button>
+                        <button class="btn btn-sm btn-secondary" data-action="viewPlanDetail" data-plan-id="${escapeHtml(plan.id)}" data-chapter="${ch.chapter_number}">查看</button>
+                        <button class="btn btn-sm btn-primary" data-action="switchToWritingForChapter" data-chapter="${ch.chapter_number}">去写作</button>
+                        <button class="btn btn-sm btn-danger" data-action="deletePlanChapter" data-plan-id="${escapeHtml(plan.id)}" data-chapter="${ch.chapter_number}">删除</button>
                     </td>
                 </tr>`;
             }
             html += '</table></div></div>';
         }
         el.innerHTML = html;
-    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
 
 // ========== Chapters ==========
@@ -504,17 +545,17 @@ async function loadChapters() {
                 <td>${ch.word_count}字</td>
                 <td>${statusBadges.join(' ')}</td>
                 <td>
-                    <button class="btn btn-sm btn-primary" onclick="openChapterReader(${ch.chapter_number})">阅读</button>
-                    <button class="btn btn-sm btn-warning" onclick="switchToWritingForChapter(${ch.chapter_number})">修改</button>
-                    <button class="btn btn-sm btn-${ch.is_finalized ? 'secondary' : 'success'}" onclick="toggleFinalize(${ch.chapter_number}, ${!ch.is_finalized})">${ch.is_finalized ? '取消定稿' : '定稿'}</button>
-                    <button class="btn btn-sm btn-info" onclick="runAudit(${ch.chapter_number})">审计</button>
-                    <button class="btn btn-sm btn-secondary" onclick="exportChapter(${ch.chapter_number})">导出</button>
+                    <button class="btn btn-sm btn-primary" data-action="openChapterReader" data-chapter="${ch.chapter_number}">阅读</button>
+                    <button class="btn btn-sm btn-warning" data-action="switchToWritingForChapter" data-chapter="${ch.chapter_number}">修改</button>
+                    <button class="btn btn-sm btn-${ch.is_finalized ? 'secondary' : 'success'}" data-action="toggleFinalize" data-chapter="${ch.chapter_number}" data-finalized="${!ch.is_finalized}">${ch.is_finalized ? '取消定稿' : '定稿'}</button>
+                    <button class="btn btn-sm btn-info" data-action="runAudit" data-chapter="${ch.chapter_number}">审计</button>
+                    <button class="btn btn-sm btn-secondary" data-action="exportChapter" data-chapter="${ch.chapter_number}">导出</button>
                 </td>
             </tr>`;
         }
         html += '</table>';
         el.innerHTML = html;
-    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
 
 async function openChapterReader(chapterNumber) {
@@ -533,7 +574,7 @@ async function openChapterReader(chapterNumber) {
 
         readerEl.innerHTML = `
             <div style="margin-bottom:16px;">
-                <button class="btn btn-sm btn-secondary" onclick="loadChapters()">← 返回列表</button>
+                <button class="btn btn-sm btn-secondary" data-action="loadChapters">← 返回列表</button>
             </div>
             <div class="card">
                 <div class="card-header" style="font-size:18px;">
@@ -547,12 +588,12 @@ async function openChapterReader(chapterNumber) {
                 <div class="card-body" style="padding:24px 32px;" id="chapterReaderContent"></div>
             </div>
             <div style="margin-top:16px;display:flex;gap:8px;">
-                <button class="btn btn-warning" onclick="switchToWritingForChapter(${ch.chapter_number})">修改本章</button>
-                <button class="btn btn-${ch.is_finalized ? 'secondary' : 'success'}" onclick="toggleFinalize(${ch.chapter_number}, ${!ch.is_finalized})">${ch.is_finalized ? '取消定稿' : '定稿'}</button>
-                <button class="btn btn-info" onclick="runAudit(${ch.chapter_number})">审计</button>
-                <button class="btn btn-secondary" onclick="exportChapter(${ch.chapter_number})">导出TXT</button>
-                ${ch.chapter_number > 1 ? `<button class="btn btn-secondary" onclick="openChapterReader(${ch.chapter_number - 1})">上一章</button>` : ''}
-                <button class="btn btn-secondary" onclick="openChapterReader(${ch.chapter_number + 1})">下一章</button>
+                <button class="btn btn-warning" data-action="switchToWritingForChapter" data-chapter="${ch.chapter_number}">修改本章</button>
+                <button class="btn btn-${ch.is_finalized ? 'secondary' : 'success'}" data-action="toggleFinalize" data-chapter="${ch.chapter_number}" data-finalized="${!ch.is_finalized}">${ch.is_finalized ? '取消定稿' : '定稿'}</button>
+                <button class="btn btn-info" data-action="runAudit" data-chapter="${ch.chapter_number}">审计</button>
+                <button class="btn btn-secondary" data-action="exportChapter" data-chapter="${ch.chapter_number}">导出TXT</button>
+                ${ch.chapter_number > 1 ? `<button class="btn btn-secondary" data-action="openChapterReader" data-chapter="${ch.chapter_number - 1}">上一章</button>` : ''}
+                <button class="btn btn-secondary" data-action="openChapterReader" data-chapter="${ch.chapter_number + 1}">下一章</button>
             </div>
         `;
         // 用textContent设置正文，防止XSS
@@ -563,13 +604,9 @@ async function openChapterReader(chapterNumber) {
         contentDiv.style.letterSpacing = '0.5px';
         contentDiv.textContent = ch.content;
     } catch (e) {
-        readerEl.innerHTML = `<div style="color:var(--danger)">加载失败：${e.message}</div>
-            <button class="btn btn-secondary" onclick="loadChapters()" style="margin-top:12px;">← 返回列表</button>`;
+        readerEl.innerHTML = `<div style="color:var(--danger)">加载失败：${escapeHtml(e.message)}</div>
+            <button class="btn btn-secondary" data-action="loadChapters" style="margin-top:12px;">← 返回列表</button>`;
     }
-}
-
-function viewChapter(chapterNumber) {
-    openChapterReader(chapterNumber);
 }
 
 function exportChapter(chapterNumber) {
@@ -593,10 +630,10 @@ async function loadPromptEditor() {
         charCardsData = (data.character_cards || []).map(c => ({...c}));
         el.innerHTML = `
             <div style="margin-bottom:16px;display:flex;gap:8px;flex-wrap:wrap;">
-                <button class="btn btn-primary" onclick="savePrompt()">保存全部修改</button>
-                <button class="btn btn-info" onclick="aiUpdateCharacters()">AI更新角色卡片</button>
-                <button class="btn btn-info" onclick="aiUpdatePlotOverview()">AI更新剧情概述</button>
-                <button class="btn btn-warning" onclick="aiUpdateAll()">AI全部更新</button>
+                <button class="btn btn-primary" data-action="savePrompt">保存全部修改</button>
+                <button class="btn btn-info" data-action="aiUpdateCharacters">AI更新角色卡片</button>
+                <button class="btn btn-info" data-action="aiUpdatePlotOverview">AI更新剧情概述</button>
+                <button class="btn btn-warning" data-action="aiUpdateAll">AI全部更新</button>
             </div>
 
             <div class="card">
@@ -611,7 +648,7 @@ async function loadPromptEditor() {
                     角色卡片
                     <div style="display:flex;gap:6px;align-items:center;">
                         <span style="color:var(--text2);font-size:12px;">共${charCount}人（主要${mainCount} / 次要${secCount} / 边缘${marCount}）</span>
-                        <button class="btn btn-sm btn-primary" onclick="addCharacterCard()">+ 添加角色</button>
+                        <button class="btn btn-sm btn-primary" data-action="addCharacterCard">+ 添加角色</button>
                     </div>
                 </div>
                 <div class="card-body" id="characterCards">
@@ -644,10 +681,10 @@ async function loadPromptEditor() {
             </div>
 
             <div style="margin-top:16px;display:flex;gap:8px;">
-                <button class="btn btn-primary" onclick="savePrompt()">保存全部修改</button>
+                <button class="btn btn-primary" data-action="savePrompt">保存全部修改</button>
             </div>
         `;
-    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
 
 async function aiUpdateCharacters() {
@@ -700,7 +737,7 @@ function renderCharCard(c, i) {
     const bgPreview = escapeHtml((c.background || '').substring(0, 60));
 
     return `<div class="char-card" id="char-${i}" style="border-left:3px solid ${color};">
-        <div style="display:flex;gap:8px;align-items:center;cursor:pointer;" onclick="toggleCharCard(${i})">
+        <div style="display:flex;gap:8px;align-items:center;cursor:pointer;" data-action="toggleCharCard" data-char-index="${i}">
             <span class="name" style="white-space:nowrap;">${escapeHtml(c.name) || '未命名'}</span>
             <select class="form-control" data-field="role_level" style="width:auto;padding:1px 4px;height:24px;font-size:12px;"
                 onclick="event.stopPropagation()" onchange="this.closest('.char-card').style.borderLeftColor=this.value==='main'?'#e94560':this.value==='secondary'?'#ff9800':'#888'">
@@ -711,7 +748,7 @@ function renderCharCard(c, i) {
             <span style="color:var(--text2);font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${bgPreview}${bgPreview.length >= 60 ? '...' : ''}</span>
             <div style="display:flex;align-items:center;gap:4px;white-space:nowrap;">
                 <span style="color:var(--text2);font-size:16px;" id="char-arrow-${i}">&#9654;</span>
-                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeCharCard(${i})">删除</button>
+                <button class="btn btn-sm btn-danger" data-action="removeCharCard" data-char-index="${i}">删除</button>
             </div>
         </div>
         <div id="char-detail-${i}" style="display:none;margin-top:10px;">
@@ -848,8 +885,8 @@ async function loadAuditPanel() {
                         <td>${statusLabel}</td>
                         <td style="color:var(--text2);font-size:12px;">${escapeHtml(item.notes || '')}</td>
                         <td>
-                            <button class="btn btn-sm btn-secondary" onclick="editResource('${cat.key}', ${i})">编辑</button>
-                            <button class="btn btn-sm btn-danger" onclick="deleteResource('${cat.key}', ${i})">删除</button>
+                            <button class="btn btn-sm btn-secondary" data-action="editResource" data-category="${escapeHtml(cat.key)}" data-index="${i}">编辑</button>
+                            <button class="btn btn-sm btn-danger" data-action="deleteResource" data-category="${escapeHtml(cat.key)}" data-index="${i}">删除</button>
                         </td>
                     </tr>`;
                 }
@@ -869,10 +906,10 @@ async function loadAuditPanel() {
                 md += `${escapeHtml(c.description)}\n\n`;
                 md += `> 建议：${escapeHtml(c.suggestion)}\n`;
                 html += `<div class="conflict-item">
-                    <div class="markdown-body">${marked.parse(md)}</div>
+                    <div class="markdown-body">${renderMarkdown(md)}</div>
                     <div style="margin-top:8px;">
-                        <button class="btn btn-sm btn-secondary" title="标记为误报" onclick="resolveConflict(${idx}, 'ignore')">忽略</button>
-                        <button class="btn btn-sm btn-warning" title="标记为已手动更新" onclick="resolveConflict(${idx}, 'update_resource')">更新资源表</button>
+                        <button class="btn btn-sm btn-secondary" title="标记为误报" data-action="resolveConflict" data-index="${idx}" data-resolution="ignore">忽略</button>
+                        <button class="btn btn-sm btn-warning" title="标记为已手动更新" data-action="resolveConflict" data-index="${idx}" data-resolution="update_resource">更新资源表</button>
                     </div>
                 </div>`;
             }
@@ -880,7 +917,7 @@ async function loadAuditPanel() {
         }
 
         el.innerHTML = html || '<div style="text-align:center;color:var(--text2);padding:40px;">暂无审计数据，先写几章再来看看</div>';
-    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
 
 // ========== Writing Workspace ==========
@@ -888,6 +925,7 @@ let writingSelectedPlan = null;
 let writingStreamContent = '';
 let writingIsStreaming = false;
 let writingEditMode = false;
+let writingChapterFinalized = false;  // 当前选中章节是否已定稿（用于"定稿/取消定稿"切换）
 
 async function loadWritingWorkspace() {
     const el = document.getElementById('writingWorkspace');
@@ -922,7 +960,7 @@ async function loadWritingWorkspace() {
                 const badge = ch.chapter_type === 'turning' ? 'badge-turning' : ch.chapter_type === 'key' ? 'badge-key' : 'badge-normal';
                 const typeLabel = ch.chapter_type === 'turning' ? '转折' : ch.chapter_type === 'key' ? '重点' : '普通';
                 planItemsHtml += `
-                    <div class="novel-item" id="wp-${ch.chapter_number}" onclick="selectWritingPlan(${ch.chapter_number})" style="padding:8px 12px;">
+                    <div class="novel-item" id="wp-${ch.chapter_number}" data-action="selectWritingPlan" data-chapter="${ch.chapter_number}" style="padding:8px 12px;">
                         <div style="display:flex;justify-content:space-between;align-items:center;">
                             <span>第${ch.chapter_number}章 ${escapeHtml(ch.title)}</span>
                             <span class="badge ${badge}">${typeLabel}</span>
@@ -952,15 +990,15 @@ async function loadWritingWorkspace() {
                         <textarea class="form-control" id="writingEditText" style="width:100%;height:100%;min-height:200px;font-size:14px;line-height:1.8;resize:vertical;"></textarea>
                     </div>
                     <div id="writingActions" style="display:flex;gap:8px;flex-wrap:wrap;">
-                        <button class="btn btn-primary" id="btnWriteChapter" onclick="doWriteInWorkspace()">开始写作</button>
+                        <button class="btn btn-primary" id="btnWriteChapter" data-action="doWriteInWorkspace">开始写作</button>
                     </div>
                     <div id="writingRevisionArea" style="display:none;">
                         <div style="display:flex;flex-direction:column;gap:8px;">
                             <div style="display:flex;gap:8px;">
                                 <textarea class="form-control" id="writingReviseInput" rows="3" placeholder="输入修改意见，AI将重写整章..." style="flex:1;"></textarea>
                                 <div style="display:flex;flex-direction:column;gap:4px;">
-                                    <button class="btn btn-warning" onclick="doReviseInWorkspace()">AI重写</button>
-                                    <button class="btn btn-info" onclick="doAIAdjustInWorkspace()">AI调整</button>
+                                    <button class="btn btn-warning" data-action="doReviseInWorkspace">AI重写</button>
+                                    <button class="btn btn-info" data-action="doAIAdjustInWorkspace">AI调整</button>
                                 </div>
                             </div>
                         </div>
@@ -974,7 +1012,7 @@ async function loadWritingWorkspace() {
             const wp = document.getElementById(`wp-${writingSelectedPlan}`);
             if (wp) wp.style.background = 'var(--accent2)';
         }
-    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
 
 function selectWritingPlan(chapterNumber) {
@@ -990,34 +1028,86 @@ function selectWritingPlan(chapterNumber) {
     loadExistingChapter(chapterNumber);
 }
 
+// 统一渲染工作台操作按钮组（此前在4处重复，且便于流完成后重建时保留编辑态）
+function renderWritingActions(isFinalized) {
+    document.getElementById('writingActions').innerHTML = `
+        <button class="btn btn-primary" data-action="doWriteInWorkspace">重新生成</button>
+        <button class="btn btn-warning" data-action="toggleEditMode">手动编辑</button>
+        <button class="btn btn-${isFinalized ? 'secondary' : 'success'}" data-action="doFinalizeInWorkspace">${isFinalized ? '取消定稿' : '定稿'}</button>
+        <button class="btn btn-info" data-action="doAuditInWorkspace">审计</button>
+        <button class="btn btn-secondary" data-action="doExportInWorkspace">导出TXT</button>
+    `;
+}
+
+// 编辑态的按钮组增强：注入保存按钮、重命名编辑按钮
+function applyEditModeUI() {
+    const actionsEl = document.getElementById('writingActions');
+    actionsEl.querySelectorAll('.btn-warning').forEach(b => { if (b.textContent === '手动编辑') b.textContent = '取消编辑'; });
+    if (!document.getElementById('btnSaveEdit')) {
+        const saveBtn = document.createElement('button');
+        saveBtn.id = 'btnSaveEdit';
+        saveBtn.className = 'btn btn-success';
+        saveBtn.textContent = '保存 (Ctrl+S)';
+        saveBtn.onclick = saveManualEdit;
+        actionsEl.insertBefore(saveBtn, actionsEl.querySelector('.btn-warning'));
+    }
+}
+
 async function loadExistingChapter(chapterNumber) {
     const outputEl = document.getElementById('writingOutput');
     const headerEl = document.getElementById('writingHeader');
-    const actionsEl = document.getElementById('writingActions');
     const revisionEl = document.getElementById('writingRevisionArea');
 
     try {
         const ch = await api(`/api/novels/${currentNovelId}/chapters/${chapterNumber}`);
+        // 竞态保护：等待期间用户已选择其他章节，丢弃本次结果
+        if (chapterNumber !== writingSelectedPlan) return;
         headerEl.innerHTML = `第${chapterNumber}章 ${escapeHtml(ch.title)} <span style="color:var(--text2);font-size:12px;">${ch.word_count}字 | ${ch.is_finalized ? '已定稿' : '未定稿'}</span>`;
         outputEl.textContent = ch.content;
         writingStreamContent = ch.content;
-
-        actionsEl.innerHTML = `
-            <button class="btn btn-primary" onclick="doWriteInWorkspace()">重新生成</button>
-            <button class="btn btn-warning" onclick="toggleEditMode()">手动编辑</button>
-            <button class="btn btn-${ch.is_finalized ? 'secondary' : 'success'}" onclick="doFinalizeInWorkspace()">${ch.is_finalized ? '取消定稿' : '定稿'}</button>
-            <button class="btn btn-info" onclick="doAuditInWorkspace()">审计</button>
-            <button class="btn btn-secondary" onclick="doExportInWorkspace()">导出TXT</button>
-        `;
+        writingChapterFinalized = ch.is_finalized;
+        renderWritingActions(ch.is_finalized);
         revisionEl.style.display = '';
     } catch (e) {
+        if (chapterNumber !== writingSelectedPlan) return;
         headerEl.textContent = `已选择：第${chapterNumber}章（未写）`;
         outputEl.innerHTML = '<span style="color:var(--text2)">点击"开始写作"生成本章内容</span>';
         writingStreamContent = '';
-
-        actionsEl.innerHTML = `<button class="btn btn-primary" id="btnWriteChapter" onclick="doWriteInWorkspace()">开始写作</button>`;
+        writingChapterFinalized = false;
+        document.getElementById('writingActions').innerHTML = `<button class="btn btn-primary" id="btnWriteChapter" data-action="doWriteInWorkspace">开始写作</button>`;
         revisionEl.style.display = 'none';
     }
+}
+
+// ========== 流式渲染（按帧批量追加，避免每 token 全量重写） ==========
+let _streamPending = '';
+let _streamScheduled = false;
+let _streamTextNode = null;
+
+function resetStreamRender() {
+    _streamPending = '';
+    _streamScheduled = false;
+    _streamTextNode = null;
+}
+
+function appendStreamToken(outputEl, token) {
+    writingStreamContent += token;
+    _streamPending += token;
+    if (_streamScheduled) return;
+    _streamScheduled = true;
+    requestAnimationFrame(() => {
+        _streamScheduled = false;
+        if (!_streamPending || !outputEl.isConnected) return;
+        if (!_streamTextNode || _streamTextNode.parentNode !== outputEl) {
+            _streamTextNode = document.createTextNode('');
+            outputEl.appendChild(_streamTextNode);
+        }
+        _streamTextNode.nodeValue += _streamPending;
+        _streamPending = '';
+        // 仅在接近底部时自动跟随滚动，避免打断用户回看
+        const nearBottom = outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight < 60;
+        if (nearBottom) outputEl.scrollTop = outputEl.scrollHeight;
+    });
 }
 
 async function doWriteInWorkspace() {
@@ -1027,39 +1117,36 @@ async function doWriteInWorkspace() {
     writingIsStreaming = true;
     writingStreamContent = '';
     const outputEl = document.getElementById('writingOutput');
+    const actionsEl = document.getElementById('writingActions');
     outputEl.innerHTML = '';
+    resetStreamRender();
+    // 首次写作的按钮带 id=btnWriteChapter；"重新生成"时按钮组已重建无此 id，需空指针保护
+    actionsEl.querySelectorAll('button').forEach(b => b.disabled = true);
     const btn = document.getElementById('btnWriteChapter');
-    btn.disabled = true;
-    btn.textContent = '生成中...';
+    if (btn) btn.textContent = '生成中...';
 
     try {
         await apiStream(
             `/api/novels/${currentNovelId}/chapters/write/stream`,
             { method: 'POST', body: JSON.stringify({ chapter_number: writingSelectedPlan }) },
-            (token) => {
-                writingStreamContent += token;
-                outputEl.textContent = writingStreamContent;
-                outputEl.scrollTop = outputEl.scrollHeight;
-            },
+            (token) => appendStreamToken(outputEl, token),
             (chapter) => {
                 writingIsStreaming = false;
-                btn.textContent = '重新生成';
-                btn.disabled = false;
-                document.getElementById('writingActions').innerHTML = `
-                    <button class="btn btn-primary" onclick="doWriteInWorkspace()">重新生成</button>
-                    <button class="btn btn-warning" onclick="toggleEditMode()">手动编辑</button>
-                    <button class="btn btn-success" onclick="doFinalizeInWorkspace()">定稿</button>
-                    <button class="btn btn-info" onclick="doAuditInWorkspace()">审计</button>
-                    <button class="btn btn-secondary" onclick="doExportInWorkspace()">导出TXT</button>
-                `;
+                writingChapterFinalized = false;
+                renderWritingActions(false);
                 document.getElementById('writingRevisionArea').style.display = '';
+                if (writingEditMode) {
+                    // 编辑态下重新生成：保留编辑UI并同步新内容
+                    document.getElementById('writingEditText').value = writingStreamContent;
+                    applyEditModeUI();
+                }
                 toast('章节生成完成！', 'success');
             }
         );
     } catch (e) {
         writingIsStreaming = false;
-        btn.textContent = '开始写作';
-        btn.disabled = false;
+        actionsEl.querySelectorAll('button').forEach(b => b.disabled = false);
+        if (btn) btn.textContent = '开始写作';
         toast('生成失败：' + e.message, 'error');
     }
 }
@@ -1074,26 +1161,22 @@ async function doReviseInWorkspace() {
     writingStreamContent = '';
     const outputEl = document.getElementById('writingOutput');
     outputEl.innerHTML = '';
+    resetStreamRender();
 
     try {
         await apiStream(
             `/api/novels/${currentNovelId}/chapters/${writingSelectedPlan}/revise/stream`,
             { method: 'POST', body: JSON.stringify({ revision意见: opinion }) },
-            (token) => {
-                writingStreamContent += token;
-                outputEl.textContent = writingStreamContent;
-                outputEl.scrollTop = outputEl.scrollHeight;
-            },
+            (token) => appendStreamToken(outputEl, token),
             (chapter) => {
                 writingIsStreaming = false;
+                writingChapterFinalized = false;
                 document.getElementById('writingReviseInput').value = '';
-                document.getElementById('writingActions').innerHTML = `
-                    <button class="btn btn-primary" onclick="doWriteInWorkspace()">重新生成</button>
-                    <button class="btn btn-warning" onclick="toggleEditMode()">手动编辑</button>
-                    <button class="btn btn-success" onclick="doFinalizeInWorkspace()">定稿</button>
-                    <button class="btn btn-info" onclick="doAuditInWorkspace()">审计</button>
-                    <button class="btn btn-secondary" onclick="doExportInWorkspace()">导出TXT</button>
-                `;
+                renderWritingActions(false);
+                if (writingEditMode) {
+                    document.getElementById('writingEditText').value = writingStreamContent;
+                    applyEditModeUI();
+                }
                 toast('修改完成！', 'success');
             }
         );
@@ -1118,17 +1201,7 @@ function toggleEditMode() {
         outputEl.style.display = 'none';
         editArea.style.display = '';
         editArea.style.flex = '1';
-        // Inject save button and rename edit button
-        const btns = actionsEl.querySelectorAll('.btn-warning');
-        btns.forEach(b => { if (b.textContent === '手动编辑') b.textContent = '取消编辑'; });
-        if (!document.getElementById('btnSaveEdit')) {
-            const saveBtn = document.createElement('button');
-            saveBtn.id = 'btnSaveEdit';
-            saveBtn.className = 'btn btn-success';
-            saveBtn.textContent = '保存 (Ctrl+S)';
-            saveBtn.onclick = saveManualEdit;
-            actionsEl.insertBefore(saveBtn, actionsEl.querySelector('.btn-warning'));
-        }
+        applyEditModeUI();
     } else {
         // Switch back to display mode
         writingEditMode = false;
@@ -1177,26 +1250,22 @@ async function doAIAdjustInWorkspace() {
     writingStreamContent = '';
     const outputEl = document.getElementById('writingOutput');
     outputEl.innerHTML = '';
+    resetStreamRender();
 
     try {
         await apiStream(
             `/api/novels/${currentNovelId}/chapters/${writingSelectedPlan}/revise/stream`,
             { method: 'POST', body: JSON.stringify({ revision意见: `在保持整体剧情和结构不变的前提下，进行以下调整：${opinion}` }) },
-            (token) => {
-                writingStreamContent += token;
-                outputEl.textContent = writingStreamContent;
-                outputEl.scrollTop = outputEl.scrollHeight;
-            },
+            (token) => appendStreamToken(outputEl, token),
             (chapter) => {
                 writingIsStreaming = false;
+                writingChapterFinalized = false;
                 document.getElementById('writingReviseInput').value = '';
-                document.getElementById('writingActions').innerHTML = `
-                    <button class="btn btn-primary" onclick="doWriteInWorkspace()">重新生成</button>
-                    <button class="btn btn-warning" onclick="toggleEditMode()">手动编辑</button>
-                    <button class="btn btn-success" onclick="doFinalizeInWorkspace()">定稿</button>
-                    <button class="btn btn-info" onclick="doAuditInWorkspace()">审计</button>
-                    <button class="btn btn-secondary" onclick="doExportInWorkspace()">导出TXT</button>
-                `;
+                renderWritingActions(false);
+                if (writingEditMode) {
+                    document.getElementById('writingEditText').value = writingStreamContent;
+                    applyEditModeUI();
+                }
                 toast('AI调整完成！', 'success');
             }
         );
@@ -1211,9 +1280,12 @@ async function doFinalizeInWorkspace() {
     try {
         await api(`/api/novels/${currentNovelId}/chapters/${writingSelectedPlan}/finalize`, {
             method: 'PUT',
-            body: JSON.stringify({ finalized: true }),
+            body: JSON.stringify({ finalized: !writingChapterFinalized }),
         });
-        toast(`第${writingSelectedPlan}章已定稿`, 'success');
+        writingChapterFinalized = !writingChapterFinalized;
+        renderWritingActions(writingChapterFinalized);
+        if (writingEditMode) applyEditModeUI();
+        toast(`第${writingSelectedPlan}章已${writingChapterFinalized ? '定稿' : '取消定稿'}`, 'success');
         loadWritingWorkspace();
     } catch (e) { toast(e.message, 'error'); }
 }
@@ -1224,7 +1296,7 @@ async function doAuditInWorkspace() {
     try {
         const result = await api(`/api/novels/${currentNovelId}/chapters/${writingSelectedPlan}/audit`, { method: 'POST' });
         let md = `## 审计报告\n\n`;
-        if (result.summary) md += `${result.summary}\n\n`;
+        if (result.summary) md += `${escapeHtml(result.summary)}\n\n`;
         if (result.conflicts && result.conflicts.length) {
             md += `### 发现冲突\n\n`;
             for (const c of result.conflicts) {
@@ -1233,8 +1305,8 @@ async function doAuditInWorkspace() {
         } else {
             md += `> 未发现冲突\n`;
         }
-        showModal('审计报告', `<div class="markdown-body">${marked.parse(md)}</div>`,
-            '<button class="btn btn-secondary" onclick="closeModal()">关闭</button>');
+        showModal('审计报告', `<div class="markdown-body">${renderMarkdown(md)}</div>`,
+            '<button class="btn btn-secondary" data-action="closeModal">关闭</button>');
     } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -1270,7 +1342,7 @@ async function loadSamples() {
             }
             el.innerHTML = html;
         }
-    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+    } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
 
 async function uploadStyleSample(input) {
@@ -1279,7 +1351,12 @@ async function uploadStyleSample(input) {
     const formData = new FormData();
     formData.append('file', file);
     try {
-        await fetch(`/api/novels/${currentNovelId}/style-sample`, { method: 'POST', body: formData });
+        const resp = await fetch(`/api/novels/${currentNovelId}/style-sample`, { method: 'POST', body: formData });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: `上传失败 (${resp.status})` }));
+            const detail = Array.isArray(err.detail) ? err.detail.map(x => x.msg).join('; ') : err.detail;
+            throw new Error(detail || `上传失败 (${resp.status})`);
+        }
         toast(`文风样本 "${file.name}" 上传成功`, 'success');
         await loadSamples();
         // 如果工作台可见，也更新状态
@@ -1296,8 +1373,8 @@ function showCreateNovel() {
         <div class="form-group"><label>小说标题</label><input class="form-control" id="new-title" placeholder="我的小说"></div>
         <div class="form-group"><label>描述</label><textarea class="form-control" id="new-desc" rows="3"></textarea></div>
         <div class="form-group"><label>基准字数/章</label><input class="form-control" id="new-words" type="number" value="3000"></div>
-    `, `<button class="btn btn-primary" onclick="createNovel()">创建</button>
-        <button class="btn btn-secondary" onclick="closeModal()">取消</button>`);
+    `, `<button class="btn btn-primary" data-action="createNovel">创建</button>
+        <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
 }
 
 async function createNovel() {
@@ -1341,8 +1418,8 @@ function showEditNovelModal() {
                 <div class="form-group"><label><input type="checkbox" id="edit-export-number" ${novel.export_keep_chapter_number ? 'checked' : ''}> 导出时保留章节号</label></div>
                 <div class="form-group"><label><input type="checkbox" id="edit-export-title" ${novel.export_keep_chapter_title ? 'checked' : ''}> 导出时保留章节标题</label></div>
             </div>
-        `, `<button class="btn btn-primary" onclick="saveNovelSettings()">保存</button>
-            <button class="btn btn-secondary" onclick="closeModal()">取消</button>`);
+        `, `<button class="btn btn-primary" data-action="saveNovelSettings">保存</button>
+            <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
     });
 }
 
@@ -1380,8 +1457,8 @@ function showImportModal() {
                 <div style="color:var(--text2);font-size:12px;margin-top:8px;">大文件分析可能需要2-5分钟</div>
             </div>
         </div>
-    `, `<button class="btn btn-primary" id="importBtn" onclick="doImport()">开始导入分析</button>
-        <button class="btn btn-secondary" onclick="closeModal()">取消</button>`);
+    `, `<button class="btn btn-primary" id="importBtn" data-action="doImport">开始导入分析</button>
+        <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
 }
 
 async function doImport() {
@@ -1406,7 +1483,7 @@ async function doImport() {
         // 展示分析结果
         showImportResult(data, file.name);
     } catch (e) {
-        document.getElementById('importStatusText').innerHTML = `<span style="color:var(--danger)">错误：${e.message}</span>`;
+        document.getElementById('importStatusText').innerHTML = `<span style="color:var(--danger)">错误：${escapeHtml(e.message)}</span>`;
         document.getElementById('importBtn').disabled = false;
         document.getElementById('importBtn').textContent = '重试';
         toast('导入失败：' + e.message, 'error');
@@ -1463,8 +1540,8 @@ function showImportResult(data, fileName) {
     }
 
     showModal('导入分析结果', resultHtml, `
-        <button class="btn btn-primary" onclick="closeModal();loadNovelDashboard(currentNovelId);">确认并查看项目</button>
-        <button class="btn btn-secondary" onclick="closeModal();showImportModal();">重新导入</button>
+        <button class="btn btn-primary" data-action="confirmImportDashboard">确认并查看项目</button>
+        <button class="btn btn-secondary" data-action="reopenImportModal">重新导入</button>
     `);
     toast('导入分析完成！已自动写入核心提示词', 'success');
 }
@@ -1483,8 +1560,8 @@ async function showGeneratePlanModal() {
         <div class="form-group"><label>方向提示词（可选，影响规划走向）</label>
             <textarea class="form-control" id="plan-hint" rows="4" placeholder="例如：这部分剧情涉及筱惠在日本的调教经历，不要增加新人物"></textarea>
         </div>
-    `, `<button class="btn btn-primary" onclick="doGeneratePlan()">生成规划</button>
-        <button class="btn btn-secondary" onclick="closeModal()">取消</button>`);
+    `, `<button class="btn btn-primary" data-action="doGeneratePlan">生成规划</button>
+        <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
 }
 
 async function doGeneratePlan() {
@@ -1531,8 +1608,8 @@ async function viewPlanDetail(planId, chapterNumber) {
             <div class="form-group"><label>场景</label><input class="form-control" id="ep-scene" value="${escapeHtml(ch.scene)}"></div>
             <div class="form-group"><label>核心情节（每行一条）</label><textarea class="form-control" id="ep-plot" rows="4">${escapeHtml((ch.core_plot||[]).join('\n'))}</textarea></div>
             <div class="form-group"><label>写作提示词</label><textarea class="form-control" id="ep-prompt" rows="6">${escapeHtml(ch.prompt)}</textarea></div>
-        `, `<button class="btn btn-primary" onclick="savePlanEdit('${planId}', ${chapterNumber})">保存修改</button>
-            <button class="btn btn-secondary" onclick="closeModal()">关闭</button>`);
+        `, `<button class="btn btn-primary" data-action="savePlanEdit" data-plan-id="${escapeHtml(planId)}" data-chapter="${chapterNumber}">保存修改</button>
+            <button class="btn btn-secondary" data-action="closeModal">关闭</button>`);
     } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -1574,67 +1651,6 @@ async function deletePlanChapter(planId, chapterNumber) {
     } catch (e) { toast(e.message, 'error'); }
 }
 
-// ========== Write Chapter ==========
-async function writeChapter(chapterNumber) {
-    showLoading(`正在生成第${chapterNumber}章...`, 'AI 正在写作，请耐心等待');
-    try {
-        const data = await api(`/api/novels/${currentNovelId}/chapters/write`, {
-            method: 'POST',
-            body: JSON.stringify({ chapter_number: chapterNumber }),
-        });
-        showModal(`第${data.chapter.chapter_number}章 - ${escapeHtml(data.chapter.title)}`, `
-            <div style="margin-bottom:12px;color:var(--text2);">字数：${data.chapter.word_count}</div>
-            <div style="white-space:pre-wrap;background:var(--bg);padding:16px;border-radius:8px;max-height:50vh;overflow-y:auto;font-size:14px;line-height:1.8;">${escapeHtml(data.chapter.content)}</div>
-        `, `<button class="btn btn-success" onclick="toggleFinalize(${data.chapter.chapter_number}, true);closeModal()">定稿</button>
-            <button class="btn btn-warning" onclick="closeModal();showReviseModal(${data.chapter.chapter_number})">修改</button>
-            <button class="btn btn-info" onclick="closeModal();runAudit(${data.chapter.chapter_number})">审计</button>
-            <button class="btn btn-secondary" onclick="closeModal()">关闭</button>`);
-        await loadPlans();
-        await loadNovels();
-    } catch (e) { toast(e.message, 'error'); }
-    finally { hideLoading(); }
-}
-
-async function viewChapter(chapterNumber) {
-    try {
-        const ch = await api(`/api/novels/${currentNovelId}/chapters/${chapterNumber}`);
-        showModal(`第${ch.chapter_number}章 - ${escapeHtml(ch.title)}`, `
-            <div style="margin-bottom:12px;color:var(--text2);">字数：${ch.word_count} | 类型：${ch.chapter_type} | 定稿：${ch.is_finalized?'是':'否'}</div>
-            <div style="white-space:pre-wrap;background:var(--bg);padding:16px;border-radius:8px;max-height:50vh;overflow-y:auto;font-size:14px;line-height:1.8;">${escapeHtml(ch.content)}</div>
-        `, `<button class="btn btn-secondary" onclick="closeModal()">关闭</button>`);
-    } catch (e) { toast(e.message, 'error'); }
-}
-
-function showReviseModal(chapterNumber) {
-    showModal(`修改第${chapterNumber}章`, `
-        <div class="form-group"><label>修改意见</label>
-            <textarea class="form-control" id="revise-opinion" rows="6" placeholder="请输入修改意见，例如：&#10;- 这段对话太生硬，改得自然些&#10;- 性描写部分加强细节&#10;- 结尾太突兀，加个过渡"></textarea>
-        </div>
-    `, `<button class="btn btn-primary" onclick="doRevise(${chapterNumber})">重新生成</button>
-        <button class="btn btn-secondary" onclick="closeModal()">取消</button>`);
-}
-
-async function doRevise(chapterNumber) {
-    const opinion = document.getElementById('revise-opinion').value;
-    if (!opinion.trim()) { toast('请输入修改意见', 'error'); return; }
-    closeModal();
-    showLoading('正在重写章节...', 'AI 正在根据修改意见重新生成');
-    try {
-        const data = await api(`/api/novels/${currentNovelId}/chapters/${chapterNumber}/revise`, {
-            method: 'POST',
-            body: JSON.stringify({ revision意见: opinion }),
-        });
-        showModal(`第${data.chapter.chapter_number}章 重写结果`, `
-            <div style="margin-bottom:12px;color:var(--text2);">字数：${data.chapter.word_count}</div>
-            <div style="white-space:pre-wrap;background:var(--bg);padding:16px;border-radius:8px;max-height:50vh;overflow-y:auto;font-size:14px;line-height:1.8;">${escapeHtml(data.chapter.content)}</div>
-        `, `<button class="btn btn-success" onclick="toggleFinalize(${data.chapter.chapter_number}, true);closeModal()">定稿</button>
-            <button class="btn btn-warning" onclick="closeModal();showReviseModal(${data.chapter.chapter_number})">再次修改</button>
-            <button class="btn btn-secondary" onclick="closeModal()">关闭</button>`);
-        await loadChapters();
-    } catch (e) { toast(e.message, 'error'); }
-    finally { hideLoading(); }
-}
-
 async function toggleFinalize(chapterNumber, finalized) {
     try {
         await api(`/api/novels/${currentNovelId}/chapters/${chapterNumber}/finalize`, {
@@ -1654,7 +1670,7 @@ async function runAudit(chapterNumber) {
         const result = await api(`/api/novels/${currentNovelId}/chapters/${chapterNumber}/audit`, {
             method: 'POST',
         });
-        let html = `<div style="margin-bottom:16px;">${result.summary || '审计完成'}</div>`;
+        let html = `<div style="margin-bottom:16px;">${escapeHtml(result.summary || '审计完成')}</div>`;
         if (result.conflicts && result.conflicts.length) {
             html += '<h3 style="color:var(--warning);margin-bottom:12px;">发现冲突</h3>';
             for (const c of result.conflicts) {
@@ -1675,7 +1691,7 @@ async function runAudit(chapterNumber) {
             html += '</table>';
         }
         showModal(`第${chapterNumber}章 审计报告`, html,
-            `<button class="btn btn-secondary" onclick="closeModal()">关闭</button>`);
+            `<button class="btn btn-secondary" data-action="closeModal">关闭</button>`);
         await loadChapters();
         await loadAuditPanel();
     } catch (e) { toast(e.message, 'error'); }
@@ -1715,8 +1731,8 @@ async function editResource(category, index) {
             </select>
         </div>
         <div class="form-group"><label>备注</label><input class="form-control" id="er-notes" value="${escapeHtml(item.notes || '')}"></div>
-    `, `<button class="btn btn-primary" onclick="saveResource('${category}', ${index})">保存</button>
-        <button class="btn btn-secondary" onclick="closeModal()">取消</button>`);
+    `, `<button class="btn btn-primary" data-action="saveResource" data-category="${escapeHtml(category)}" data-index="${index}">保存</button>
+        <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
 }
 
 async function saveResource(category, index) {
@@ -1744,6 +1760,72 @@ async function deleteResource(category, index) {
         await loadAuditPanel();
     } catch (e) { toast(e.message, 'error'); }
 }
+
+// ========== 事件委托 ==========
+// 所有按钮用 data-action 声明动作、data-* 属性传参，统一在此分发。
+// 替代 inline onclick：消除 HTML属性/JS字符串双重解析的注入面，并集中事件处理。
+const ACTION_HANDLERS = {
+    // 小说列表/仪表盘
+    selectNovel: (el) => selectNovel(el.dataset.novelId),
+    deleteNovel: (el) => deleteNovel(el.dataset.novelId),
+    showCreateNovel: () => showCreateNovel(),
+    showImportModal: () => showImportModal(),
+    showEditNovelModal: () => showEditNovelModal(),
+    switchTab: (el) => switchTab(el, el.dataset.tab),
+    openStyleFilePicker: () => document.getElementById('styleFile').click(),
+    // 规划
+    showGeneratePlanModal: () => showGeneratePlanModal(),
+    deletePlan: (el) => deletePlan(el.dataset.planId),
+    deletePlanChapter: (el) => deletePlanChapter(el.dataset.planId, +el.dataset.chapter),
+    viewPlanDetail: (el) => viewPlanDetail(el.dataset.planId, +el.dataset.chapter),
+    // 章节
+    loadChapters: () => loadChapters(),
+    exportAllChapters: () => exportAllChapters(),
+    openChapterReader: (el) => openChapterReader(+el.dataset.chapter),
+    switchToWritingForChapter: (el) => switchToWritingForChapter(+el.dataset.chapter),
+    toggleFinalize: (el) => toggleFinalize(+el.dataset.chapter, el.dataset.finalized === 'true'),
+    runAudit: (el) => runAudit(+el.dataset.chapter),
+    exportChapter: (el) => exportChapter(+el.dataset.chapter),
+    // 写作工作台
+    selectWritingPlan: (el) => selectWritingPlan(+el.dataset.chapter),
+    doWriteInWorkspace: () => doWriteInWorkspace(),
+    doReviseInWorkspace: () => doReviseInWorkspace(),
+    doAIAdjustInWorkspace: () => doAIAdjustInWorkspace(),
+    toggleEditMode: () => toggleEditMode(),
+    doFinalizeInWorkspace: () => doFinalizeInWorkspace(),
+    doAuditInWorkspace: () => doAuditInWorkspace(),
+    doExportInWorkspace: () => doExportInWorkspace(),
+    // 核心提示词
+    savePrompt: () => savePrompt(),
+    aiUpdateCharacters: () => aiUpdateCharacters(),
+    aiUpdatePlotOverview: () => aiUpdatePlotOverview(),
+    aiUpdateAll: () => aiUpdateAll(),
+    addCharacterCard: () => addCharacterCard(),
+    toggleCharCard: (el) => toggleCharCard(+el.dataset.charIndex),
+    removeCharCard: (el, e) => { e.stopPropagation(); removeCharCard(+el.dataset.charIndex); },
+    // 审计
+    resolveConflict: (el) => resolveConflict(+el.dataset.index, el.dataset.resolution),
+    editResource: (el) => editResource(el.dataset.category, +el.dataset.index),
+    deleteResource: (el) => deleteResource(el.dataset.category, +el.dataset.index),
+    saveResource: (el) => saveResource(el.dataset.category, +el.dataset.index),
+    // 弹窗
+    closeModal: () => closeModal(),
+    createNovel: () => createNovel(),
+    saveNovelSettings: () => saveNovelSettings(),
+    doImport: () => doImport(),
+    doGeneratePlan: () => doGeneratePlan(),
+    savePlanEdit: (el) => savePlanEdit(el.dataset.planId, +el.dataset.chapter),
+    // 组合动作（原 onclick 里的多语句）
+    confirmImportDashboard: () => { closeModal(); loadNovelDashboard(currentNovelId); },
+    reopenImportModal: () => { closeModal(); showImportModal(); },
+};
+
+document.addEventListener('click', function (e) {
+    const el = e.target.closest('[data-action]');
+    if (!el) return;
+    const handler = ACTION_HANDLERS[el.dataset.action];
+    if (handler) handler(el, e);
+});
 
 // ========== Init ==========
 loadNovels();
