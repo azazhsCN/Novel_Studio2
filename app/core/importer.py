@@ -8,12 +8,43 @@ from app.models.novel import NovelProject, CorePromptModules, CharacterCard
 
 logger = logging.getLogger(__name__)
 
+# 送入AI分析的字符上限：避免几MB的小说全文直发LLM导致失败/巨额费用
+MAX_ANALYSIS_CHARS = 60_000
+
+
+def _sample_long_text(text: str, max_chars: int = MAX_ANALYSIS_CHARS) -> str:
+    """长文本采样：保留开头+结尾+均匀抽取10段，控制送入AI的量"""
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 3
+    tail = max_chars // 3
+    middle = text[head:-tail]
+    samples = []
+    mid_budget = max_chars - head - tail
+    if middle and mid_budget > 0:
+        sample_size = mid_budget // 10
+        if sample_size > 0:
+            step = max(len(middle) // 10, 1)
+            for i in range(10):
+                start = i * step
+                samples.append(middle[start:start + sample_size])
+    parts = [text[:head], "\n\n...（中间内容省略）...\n\n"]
+    if samples:
+        parts.append("\n\n...（中间内容省略）...\n\n".join(samples))
+        parts.append("\n\n...（中间内容省略）...\n\n")
+    parts.append(text[-tail:])
+    return "".join(parts)
+
 
 async def analyze_novel(novel_text: str) -> dict:
     """调用AI分析小说内容，返回结构化信息"""
     logger.info(f"开始分析小说，原文长度: {len(novel_text)} 字符")
 
-    prompt = build_import_analysis_prompt(novel_text)
+    sampled = _sample_long_text(novel_text)
+    if len(sampled) < len(novel_text):
+        logger.info(f"原文过长，已采样至 {len(sampled)} 字符后再分析")
+
+    prompt = build_import_analysis_prompt(sampled)
     logger.info(f"提示词长度: {len(prompt)} 字符")
 
     try:

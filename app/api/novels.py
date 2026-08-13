@@ -40,11 +40,11 @@ class NovelCreateRequest(BaseModel):
 
 
 class NovelUpdateRequest(BaseModel):
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, min_length=1, max_length=200)
     description: Optional[str] = None
-    base_word_count: Optional[int] = None
-    key_chapter_ratio: Optional[float] = None
-    turning_chapter_ratio: Optional[float] = None
+    base_word_count: Optional[int] = Field(default=None, gt=0, le=100000)
+    key_chapter_ratio: Optional[float] = Field(default=None, gt=0, le=10)
+    turning_chapter_ratio: Optional[float] = Field(default=None, gt=0, le=10)
     export_keep_chapter_number: Optional[bool] = None
     export_keep_chapter_title: Optional[bool] = None
 
@@ -226,11 +226,14 @@ async def import_novel_file(novel_id: str, file: UploadFile = File(...)):
     try:
         analysis = await analyze_novel(text)
     except Exception as e:
-        raise HTTPException(500, f"AI分析失败: {str(e)}")
+        logger.error(f"导入AI分析失败: {e}", exc_info=True)
+        raise HTTPException(500, "导入AI分析失败，请重试")
 
-    # 检查AI返回是否包含错误
+    # 检查AI返回是否包含错误（原始响应只记日志，不回显给客户端，防止反射注入）
     if analysis.get("error"):
-        raise HTTPException(500, f"AI分析返回异常: {analysis.get('error')}\n原始响应前500字: {str(analysis.get('raw', ''))[:500]}")
+        logger.warning("AI分析返回异常: %s", analysis.get("error"))
+        logger.debug("原始响应前500字: %s", str(analysis.get("raw", ""))[:500])
+        raise HTTPException(500, "AI分析返回异常，无法解析分析结果，请重试或更换小说文件")
 
     # 更新核心提示词
     if analysis.get("basic_setting"):
@@ -616,11 +619,12 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
                 # === 第一步：处理早期章节 ===
                 # 找出早期中未被缓存覆盖的新章节
                 early_new = [ch for ch in early_chapters if ch.chapter_number > cached_end]
-                # 找出仍有效的旧缓存（属于早期章节范围）
+                # 找出仍有效的旧缓存：起点落在早期范围内的段（含跨越边界的段）都归早期，
+                # 保证所有缓存段都被重新处理，不会出现覆盖缺口
+                early_boundary = early_chapters[-1].chapter_number
                 early_cached = [
                     s for s in cached_segments
-                    if s.end_chapter <= early_chapters[-1].chapter_number
-                    and s.end_chapter <= cached_end
+                    if s.start_chapter <= early_boundary
                 ]
 
                 early_segments = []
@@ -643,8 +647,7 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
                 recent_new = [ch for ch in recent_chapters if ch.chapter_number > cached_end]
                 recent_old_cached = [
                     s for s in cached_segments
-                    if s.start_chapter >= early_chapters[-1].chapter_number + 1
-                    and s.end_chapter <= cached_end
+                    if s.start_chapter > early_boundary
                 ]
 
                 recent_segments = []

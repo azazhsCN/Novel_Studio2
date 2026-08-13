@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import datetime
 import json
 from app.core.config import get_novel_subdirs
+from app.core.storage import backup_file
 
 
 class ResourceItem(BaseModel):
@@ -24,6 +25,7 @@ class AuditConflict(BaseModel):
     suggestion: str = ""
     resolved: bool = False
     resolution: str = ""  # ignore / update_resource / modify_chapter
+    notes: str = ""  # 解决备注
 
 
 class ResourceTracker(BaseModel):
@@ -39,6 +41,8 @@ class ResourceTracker(BaseModel):
         path = dirs["base"] / "resources.json"
         tmp = path.with_suffix('.json.tmp')
         tmp.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        if path.exists():
+            backup_file(path)  # 覆盖前保留历史版本
         tmp.replace(path)
 
     @classmethod

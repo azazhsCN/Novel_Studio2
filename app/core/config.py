@@ -8,6 +8,7 @@ CONFIG_PATH = BASE_DIR / "config.yaml"
 DATA_DIR = BASE_DIR / "data"
 
 _NOVEL_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,50}$')
+_PLAN_ID_RE = re.compile(r'^[a-f0-9]{8}$')
 _CONFIG_CACHE = None
 
 
@@ -15,6 +16,12 @@ def validate_novel_id(novel_id: str):
     """校验 novel_id，防止路径遍历和非法字符"""
     if not _NOVEL_ID_RE.match(novel_id):
         raise ValueError(f"无效的项目ID: '{novel_id}'，仅允许字母、数字、下划线、连字符，长度1-50")
+
+
+def validate_plan_id(plan_id: str):
+    """校验 plan_id，防止路径遍历（规划ID由代码生成，为8位十六进制）"""
+    if not _PLAN_ID_RE.match(plan_id):
+        raise ValueError(f"无效的规划ID: '{plan_id}'")
 
 
 def load_config() -> dict:
