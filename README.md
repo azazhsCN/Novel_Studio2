@@ -61,7 +61,27 @@
 
 ## 快速开始
 
-### 安装
+### 方式一：便携版 zip（推荐普通用户）
+
+无需 git，下载解压即用：
+
+1. 从 [Releases](https://github.com/azazhsCN/Novel_Studio2/releases) 下载最新版 `Novel_Studio2_verX.X.XX_portable.zip`
+2. 解压到任意目录（建议英文路径，如 `D:\Novel_Studio2`）
+3. 安装 Python 3.10+：[python.org/downloads](https://www.python.org/downloads/)，安装时勾选 **Add python.exe to PATH**
+4. 双击 `start.bat`：
+   - 首次运行会自动安装依赖，并自动创建 `config.yaml` 后用记事本打开
+   - 填入你的 API Key（`api_key` 一行），保存关闭后**再次双击 `start.bat`** 即可启动
+5. 浏览器访问 http://127.0.0.1:8000，开始写作
+6. 停止服务：双击 `stop.bat`
+
+> 所有小说数据保存在本地 `data/` 目录。升级新版本时，解压后只需覆盖 `app/`、`run.py` 等文件，
+> **不要覆盖 `config.yaml`**（否则需重新填 API Key），数据不受影响。
+>
+> 小提示：删除小说项目会先移入 `data/.trash/` 回收站，误删可手动恢复；章节文件覆盖前会自动保留 `.bak` 备份。
+
+### 方式二：源码运行（开发者）
+
+#### 安装
 
 ```bash
 # 克隆项目
@@ -72,7 +92,7 @@ cd Novel_Studio2
 pip install -r requirements.txt
 ```
 
-### 配置
+#### 配置
 
 复制示例配置文件并编辑：
 
@@ -98,7 +118,7 @@ api:
 export NOVEL_API_KEY="your-api-key"
 ```
 
-### 启动
+#### 启动
 
 ```bash
 python run.py
@@ -161,7 +181,7 @@ Novel_Studio2/
 | 前端 | 单页 HTML/JS | 暗色主题，~1700 行 |
 | 存储 | 本地文件系统 | JSON 元数据 + TXT 内容 |
 | AI | DeepSeek V4 Flash | 1M 上下文，384K 输出 |
-| 写入 | 非原子写入 | temp + rename 防数据损坏 |
+| 存储 | 原子写入 + 备份轮转 | temp+rename 防损坏，`.bak` 可回滚，删除进回收站 |
 
 ## 许可证
 
