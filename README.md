@@ -8,7 +8,7 @@
 
 ---
 
-专为长篇小说写作设计的 AI 工作台。深度适配 DeepSeek V4 Flash，充分利用 **100 万 token 超长上下文**，让 AI 一次性"读完"你的整本书，告别上下文碎片化。
+专为长篇小说写作设计的 AI 工作台。深度适配 DeepSeek V4.1 Flash（`deepseek-flash`），充分利用 **100 万 token 超长上下文**，让 AI 一次性"读完"你的整本书，告别上下文碎片化。
 
 <p align="center">
   <img src="assets/Novel_Studio2_ScreenShot.png" width="800" alt="Novel Studio2 界面截图">
@@ -18,7 +18,7 @@
 
 ### 🧠 100 万 token 上下文，真正"读懂"长篇
 
-传统 AI 写作工具受限于 8K-128K 上下文，写到后期"忘记"前期设定。Novel Studio2 专为 DeepSeek V4 Flash 的 1M 上下文窗口优化：
+传统 AI 写作工具受限于 8K-128K 上下文，写到后期"忘记"前期设定。Novel Studio2 专为 DeepSeek V4.1 Flash 的 1M 上下文窗口优化：
 
 - **一次性注入全书内容** — 核心提示词 + 已写章节 + 角色卡片 + 剧情概述，全部塞进上下文
 - **384K 最大输出** — 单次生成超长章节，无需拼接
@@ -106,7 +106,7 @@ cp config.example.yaml config.yaml
 api:
   base_url: "https://api.example.com/v1"  # 替换为你的 API 端点
   api_key: "your-api-key-here"            # 替换为你的 API Key
-  model: "deepseek-v4-flash"              # 模型名称
+  model: "deepseek-flash"                 # 模型名称（DeepSeek-V4.1-Flash）
   max_tokens: 384000                       # 最大输出 token 数
   context_window: 1000000                  # 1M 上下文窗口
   temperature: 0.8                         # 温度参数
@@ -178,9 +178,9 @@ Novel_Studio2/
 | 组件 | 技术 | 说明 |
 |------|------|------|
 | 后端 | Python FastAPI | 异步高性能 Web 框架 |
-| 前端 | 单页 HTML/JS | 暗色主题，~1700 行 |
+| 前端 | 单页 HTML/JS | 暗色主题，~1834 行 |
 | 存储 | 本地文件系统 | JSON 元数据 + TXT 内容 |
-| AI | DeepSeek V4 Flash | 1M 上下文，384K 输出 |
+| AI | DeepSeek V4.1 Flash（`deepseek-flash`） | 1M 上下文，384K 输出 |
 | 存储 | 原子写入 + 备份轮转 | temp+rename 防损坏，`.bak` 可回滚，删除进回收站 |
 
 ## 许可证

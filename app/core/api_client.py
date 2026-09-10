@@ -16,6 +16,12 @@ class APIClient:
         self.max_tokens = cfg["max_tokens"]
         self.temperature = cfg["temperature"]
         self.system_prompt = cfg.get("system_prompt", "")
+        # 思考模式开关（config.yaml: api.thinking），默认关闭。
+        # 官方文档：DeepSeek-V4.1-Flash 默认开启思考模式（effort=high）；
+        # 但思考模式下 temperature 不生效，而本项目正文生成依赖 temperature 控制文风，
+        # 且长文本生成越快越好，故默认走非思考模式。
+        # 参见 https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/
+        self.thinking = cfg.get("thinking", False)
 
     def reload(self):
         """强制重新加载配置"""
@@ -42,6 +48,8 @@ class APIClient:
             "temperature": temperature if temperature is not None else self.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
             "stream": False,
+            # 思考模式：disabled 关闭 / enabled 开启；关闭时不得同时传 reasoning_effort
+            "thinking": {"type": "enabled" if self.thinking else "disabled"},
         }
 
         async with httpx.AsyncClient(timeout=600.0) as client:
@@ -70,6 +78,8 @@ class APIClient:
             "temperature": temperature if temperature is not None else self.temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
             "stream": True,
+            # 思考模式：disabled 关闭 / enabled 开启；关闭时不得同时传 reasoning_effort
+            "thinking": {"type": "enabled" if self.thinking else "disabled"},
         }
 
         async with httpx.AsyncClient(timeout=600.0) as client:
