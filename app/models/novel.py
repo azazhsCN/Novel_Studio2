@@ -114,23 +114,29 @@ class NovelProject(BaseModel):
         return self.base_word_count
 
     def update_stats(self):
-        """从文件系统重新统计：已规划(未写)、已定稿章节数"""
+        """从文件系统重新统计：已规划(未写)、已定稿章节数
+
+        定稿口径以章节 _meta.json 里的 is_finalized 为准。此前按 chapters/*.txt
+        的文件数统计，会把未定稿章节也算成"已定稿"（统计口径错误）。
+        """
         dirs = get_novel_subdirs(self.id)
         plans_dir = dirs["plans"]
         chapters_dir = dirs["chapters"]
 
-        # 收集所有已写章节号
+        # 收集所有已写章节号，并按 is_finalized 统计定稿数
         written_numbers = set()
         finalized = 0
         for f in chapters_dir.glob("*_meta.json"):
             try:
                 meta = json.loads(f.read_text(encoding="utf-8"))
-                written_numbers.add(meta.get("chapter_number", 0))
-            except (json.JSONDecodeError, OSError, KeyError) as e:
-                import logging
-                logging.getLogger(__name__).warning(f"读取元数据失败 {f.name}: {e}")
-        for f in chapters_dir.glob("*.txt"):
-            if not f.name.endswith('.tmp'):
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"读取元数据失败 {f.name}: {e}")
+                continue
+            ch_num = meta.get("chapter_number")
+            if not isinstance(ch_num, int):
+                continue
+            written_numbers.add(ch_num)
+            if meta.get("is_finalized"):
                 finalized += 1
 
         # 统计已规划但未写作的章节数
@@ -138,13 +144,13 @@ class NovelProject(BaseModel):
         for f in plans_dir.glob("*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
-                for ch in data.get("chapters", []):
-                    ch_num = ch.get("chapter_number", 0)
-                    if ch_num not in written_numbers:
-                        planned_unwritten += 1
             except (json.JSONDecodeError, OSError) as e:
-                import logging
-                logging.getLogger(__name__).warning(f"读取规划失败 {f.name}: {e}")
+                logger.warning(f"读取规划失败 {f.name}: {e}")
+                continue
+            for ch in data.get("chapters", []):
+                ch_num = ch.get("chapter_number", 0)
+                if ch_num not in written_numbers:
+                    planned_unwritten += 1
 
         self.total_planned = planned_unwritten
         self.total_finalized = finalized

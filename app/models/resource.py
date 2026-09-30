@@ -5,6 +5,16 @@ import json
 from app.core.config import get_novel_subdirs
 from app.core.storage import backup_file
 
+# 首选的资源分类（键 → 中文名）。历史数据里出现过模型外分类（如 skill、system_character），
+# 一律保留并展示，不做静默丢弃；顺序即前端展示顺序。
+RESOURCE_CATEGORIES = {
+    "wealth": "财富/资产",
+    "item": "重要物品",
+    "system": "系统/数值",
+    "character_status": "人物状态",
+    "foreshadow": "伏笔/悬念",
+}
+
 
 class ResourceItem(BaseModel):
     """单条资源追踪项"""
@@ -54,10 +64,26 @@ class ResourceTracker(BaseModel):
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
     def add_resource(self, item: ResourceItem):
-        # 检查是否已存在同名同类资源
-        for i, r in enumerate(self.resources):
+        """按 (category, name) 字段级合并
+
+        此前是整体替换（self.resources[i] = item），会把原有的"引入章节"清零、
+        把人工填写的备注清空。现在只更新审计真正给出的字段。
+        """
+        for r in self.resources:
             if r.category == item.category and r.name == item.name:
-                self.resources[i] = item
+                if item.value:
+                    r.value = item.value
+                if item.chapter_introduced:
+                    r.chapter_introduced = item.chapter_introduced
+                if item.chapter_updated:
+                    r.chapter_updated = item.chapter_updated
+                if item.notes:
+                    r.notes = item.notes
+                if item.status == "destroyed":
+                    r.status = "destroyed"
+                elif r.status != "destroyed":
+                    # 已销毁的资源再次出现属于冲突，交由审计报告提示，不在此静默复活
+                    r.status = item.status
                 return
         self.resources.append(item)
 
@@ -78,25 +104,27 @@ class ResourceTracker(BaseModel):
                 self.conflicts[index].notes = notes
 
     def get_summary_for_prompt(self) -> str:
-        """生成资源摘要，用于嵌入审计提示词"""
+        """生成资源摘要，用于嵌入审计提示词（含模型外分类，不静默丢弃）"""
         lines = ["## 当前资源追踪状态\n"]
 
-        categories = {
-            "wealth": "财富/资产",
-            "item": "重要物品",
-            "system": "系统/数值",
-            "character_status": "人物状态",
-            "foreshadow": "伏笔/悬念",
-        }
+        grouped: dict[str, list[ResourceItem]] = {}
+        for r in self.resources:
+            grouped.setdefault(r.category, []).append(r)
 
-        for cat_key, cat_name in categories.items():
-            items = self.get_resources_by_category(cat_key)
-            if items:
-                lines.append(f"### {cat_name}")
-                for item in items:
-                    status_mark = "" if item.status == "active" else f" [{item.status}]"
-                    lines.append(f"- {item.name}：{item.value}{status_mark}")
-                lines.append("")
+        def append_group(cat_name: str, items: list[ResourceItem]) -> None:
+            if not items:
+                return
+            lines.append(f"### {cat_name}")
+            for item in items:
+                status_mark = "" if item.status == "active" else f" [{item.status}]"
+                lines.append(f"- {item.name}：{item.value}{status_mark}")
+            lines.append("")
+
+        for cat_key, cat_name in RESOURCE_CATEGORIES.items():
+            append_group(cat_name, grouped.pop(cat_key, []))
+        # 模型外分类（历史数据里的 skill / system_character 等）也要进入提示词
+        for cat_key in sorted(grouped):
+            append_group(f"{cat_key}（未归类）", grouped[cat_key])
 
         unresolved = self.get_unresolved_conflicts()
         if unresolved:

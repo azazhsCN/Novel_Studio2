@@ -864,35 +864,30 @@ async function loadAuditPanel() {
             </div>
         `;
 
-        // Resources (editable tables)
-        const categories = [
-            { key: 'wealth', label: '财富/资产' },
-            { key: 'item', label: '重要物品' },
-            { key: 'system', label: '系统/数值' },
-            { key: 'character_status', label: '人物状态' },
-            { key: 'foreshadow', label: '伏笔/悬念' },
-        ];
-        for (const cat of categories) {
-            const items = data.resources[cat.key] || [];
-            if (items.length) {
-                let tableHtml = `<table class="table"><tr><th>名称</th><th>值</th><th>状态</th><th>备注</th><th>操作</th></tr>`;
-                for (let i = 0; i < items.length; i++) {
-                    const item = items[i];
-                    const statusLabel = item.status === 'active' ? '生效中' : item.status === 'destroyed' ? '已销毁' : item.status === 'resolved' ? '已回收' : escapeHtml(item.status);
-                    tableHtml += `<tr>
-                        <td>${escapeHtml(item.name)}</td>
-                        <td>${escapeHtml(item.value)}</td>
-                        <td>${statusLabel}</td>
-                        <td style="color:var(--text2);font-size:12px;">${escapeHtml(item.notes || '')}</td>
-                        <td>
-                            <button class="btn btn-sm btn-secondary" data-action="editResource" data-category="${escapeHtml(cat.key)}" data-index="${i}">编辑</button>
-                            <button class="btn btn-sm btn-danger" data-action="deleteResource" data-category="${escapeHtml(cat.key)}" data-index="${i}">删除</button>
-                        </td>
-                    </tr>`;
-                }
-                tableHtml += '</table>';
-                html += `<div class="card"><div class="card-header">${cat.label}</div><div class="card-body">${tableHtml}</div></div>`;
+        // Resources (editable tables)：按后端返回的分类渲染，
+        // 模型外分类（历史数据里的 skill / system_character 等）同样展示，避免静默丢失
+        const categoryLabels = data.resource_category_labels || {};
+        const resourceGroups = data.resources || {};
+        for (const [catKey, items] of Object.entries(resourceGroups)) {
+            if (!items || !items.length) continue;
+            const catLabel = categoryLabels[catKey] || `${catKey}（未归类）`;
+            let tableHtml = `<table class="table"><tr><th>名称</th><th>值</th><th>状态</th><th>备注</th><th>操作</th></tr>`;
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                const statusLabel = item.status === 'active' ? '生效中' : item.status === 'destroyed' ? '已销毁' : item.status === 'resolved' ? '已回收' : escapeHtml(item.status);
+                tableHtml += `<tr>
+                    <td>${escapeHtml(item.name)}</td>
+                    <td>${escapeHtml(item.value)}</td>
+                    <td>${statusLabel}</td>
+                    <td style="color:var(--text2);font-size:12px;">${escapeHtml(item.notes || '')}</td>
+                    <td>
+                        <button class="btn btn-sm btn-secondary" data-action="editResource" data-category="${escapeHtml(catKey)}" data-index="${i}">编辑</button>
+                        <button class="btn btn-sm btn-danger" data-action="deleteResource" data-category="${escapeHtml(catKey)}" data-index="${i}">删除</button>
+                    </td>
+                </tr>`;
             }
+            tableHtml += '</table>';
+            html += `<div class="card"><div class="card-header">${escapeHtml(catLabel)}</div><div class="card-body">${tableHtml}</div></div>`;
         }
 
         // Unresolved conflicts (markdown rendering)
@@ -1737,7 +1732,7 @@ async function editResource(category, index) {
 
 async function saveResource(category, index) {
     try {
-        await api(`/api/novels/${currentNovelId}/audit/resources/${category}/${index}`, {
+        await api(`/api/novels/${currentNovelId}/audit/resources/${encodeURIComponent(category)}/${index}`, {
             method: 'PUT',
             body: JSON.stringify({
                 name: document.getElementById('er-name').value,
@@ -1755,7 +1750,7 @@ async function saveResource(category, index) {
 async function deleteResource(category, index) {
     if (!confirm('确定删除此资源项？')) return;
     try {
-        await api(`/api/novels/${currentNovelId}/audit/resources/${category}/${index}`, { method: 'DELETE' });
+        await api(`/api/novels/${currentNovelId}/audit/resources/${encodeURIComponent(category)}/${index}`, { method: 'DELETE' });
         toast('资源已删除', 'success');
         await loadAuditPanel();
     } catch (e) { toast(e.message, 'error'); }

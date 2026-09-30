@@ -7,7 +7,9 @@ from app.core.prompt_builder import build_audit_prompt
 from app.core.importer import _extract_json
 from app.models.novel import NovelProject
 from app.models.chapter import Chapter
-from app.models.resource import ResourceTracker, ResourceItem, AuditConflict
+from app.models.resource import (
+    ResourceTracker, ResourceItem, AuditConflict, RESOURCE_CATEGORIES,
+)
 
 
 async def audit_chapter(project: NovelProject, chapter: Chapter) -> dict:
@@ -109,14 +111,23 @@ async def get_audit_report(novel_id: str) -> dict:
             entry["actual_index"] = i
             unresolved_with_index.append(entry)
 
+    # 按分类分组：已知 5 类按固定顺序在前，模型外分类追加在后（不再静默丢弃）
+    grouped: dict[str, list[dict]] = {}
+    for r in tracker.resources:
+        grouped.setdefault(r.category, []).append(r.model_dump())
+
+    resources: dict[str, list[dict]] = {}
+    resource_category_labels: dict[str, str] = {}
+    for cat_key, cat_name in RESOURCE_CATEGORIES.items():
+        resources[cat_key] = grouped.pop(cat_key, [])
+        resource_category_labels[cat_key] = cat_name
+    for cat_key in sorted(grouped):
+        resources[cat_key] = grouped[cat_key]
+        resource_category_labels[cat_key] = f"{cat_key}（未归类）"
+
     return {
-        "resources": {
-            "wealth": [r.model_dump() for r in tracker.get_resources_by_category("wealth")],
-            "item": [r.model_dump() for r in tracker.get_resources_by_category("item")],
-            "system": [r.model_dump() for r in tracker.get_resources_by_category("system")],
-            "character_status": [r.model_dump() for r in tracker.get_resources_by_category("character_status")],
-            "foreshadow": [r.model_dump() for r in tracker.get_resources_by_category("foreshadow")],
-        },
+        "resources": resources,
+        "resource_category_labels": resource_category_labels,
         "unresolved_conflicts": unresolved_with_index,
         "total_resources": len(tracker.resources),
         "total_conflicts": len(tracker.conflicts),

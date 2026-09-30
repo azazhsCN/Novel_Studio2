@@ -240,12 +240,20 @@ async def import_novel_file(novel_id: str, file: UploadFile = File(...)):
         project.core_prompt.basic_setting = analysis["basic_setting"]
     if analysis.get("character_cards"):
         cards = []
+        skipped = 0
         for c in analysis["character_cards"]:
             try:
                 cards.append(CharacterCard(**c))
-            except Exception:
-                pass  # 跳过格式异常的角色卡片
-        project.core_prompt.character_cards = cards
+            except Exception as e:
+                skipped += 1
+                logger.warning(f"导入分析：跳过格式异常的角色卡片: {e}")
+        if skipped:
+            logger.warning(
+                f"导入分析：{skipped}/{len(analysis['character_cards'])} 张角色卡片格式异常被跳过"
+            )
+        # 全部解析失败时保持原值，不得用空列表覆盖已有卡片
+        if cards:
+            project.core_prompt.character_cards = cards
     if analysis.get("plot_overview"):
         project.core_prompt.plot_overview = analysis["plot_overview"]
     if analysis.get("writing_style"):
@@ -473,17 +481,31 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
         try:
             char_response = await api_client.chat(char_prompt)
             char_data = _extract_json(char_response)
-            if char_data.get("character_cards"):
-                new_cards = []
-                for c in char_data["character_cards"]:
-                    try:
-                        new_cards.append(CharacterCard(**c))
-                    except Exception:
-                        pass
-                project.core_prompt.character_cards = new_cards
         except Exception as e:
-            if req.scope == "characters":
-                raise HTTPException(500, f"角色分析失败: {str(e)}")
+            logger.error(f"角色分析失败: {e}", exc_info=True)
+            raise HTTPException(500, f"角色分析失败: {str(e)}")
+
+        raw_cards = char_data.get("character_cards")
+        if not raw_cards:
+            # 解析失败或未返回卡片：绝不能拿空列表覆盖现有角色卡片（此前会被静默清空）
+            raise HTTPException(500, "角色分析失败：AI响应中没有可用的角色卡片，已保留原有角色卡片")
+
+        new_cards = []
+        skipped = 0
+        for c in raw_cards:
+            try:
+                new_cards.append(CharacterCard(**c))
+            except Exception as e:
+                skipped += 1
+                name = c.get("name") if isinstance(c, dict) else "?"
+                logger.warning(f"跳过格式异常的角色卡片 {name}: {e}")
+        if not new_cards:
+            raise HTTPException(
+                500, f"角色分析失败：{len(raw_cards)}张角色卡片全部格式异常，已保留原有角色卡片"
+            )
+        if skipped:
+            logger.warning(f"角色分析：{skipped}/{len(raw_cards)} 张角色卡片格式异常被跳过")
+        project.core_prompt.character_cards = new_cards
 
     if req.scope == "plot_overview" or req.scope == "all":
         # AI更新剧情概述（增量缓存 + 分段处理）
@@ -673,10 +695,13 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
                     s.summary for s in all_new_segments
                 )
 
+        except HTTPException:
+            raise
         except Exception as e:
-            if req.scope == "plot_overview":
-                raise HTTPException(500, f"剧情概述更新失败: {str(e)}")
+            logger.error(f"剧情概述更新失败: {e}", exc_info=True)
+            raise HTTPException(500, f"剧情概述更新失败: {str(e)}")
 
+    # 任一 scope 失败都直接抛错、不落盘：宁可整体不更新，也不留下半套提示词
     project.save()
 
     return {
