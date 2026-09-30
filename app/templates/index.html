@@ -1583,7 +1583,8 @@ async function showGeneratePlanModal() {
         <div class="form-group"><label>起始章节号</label><input class="form-control" id="plan-start" type="number" value="${startVal}"></div>
         <div class="form-group"><label>规划章节数</label><input class="form-control" id="plan-num" type="number" value="10"></div>
         <div class="form-group"><label>方向提示词（可选，影响规划走向）</label>
-            <textarea class="form-control" id="plan-hint" rows="4" placeholder="例如：这部分剧情涉及筱惠在日本的调教经历，不要增加新人物"></textarea>
+            <textarea class="form-control" id="plan-hint" rows="4" placeholder="例如：本批以推进主线为主，尽量不新增人物；节奏先缓后快，多写人物心理与场景细节"></textarea>
+            <div style="font-size:12px;color:var(--text2);margin-top:4px;">可写：本批目标（推进主线 / 铺垫支线）、人物增减、节奏与篇幅分配、需要安排的转折或高潮、必须保留的伏笔</div>
         </div>
     `, `<button class="btn btn-primary" data-action="doGeneratePlan">生成规划</button>
         <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
