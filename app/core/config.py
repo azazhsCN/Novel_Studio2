@@ -90,3 +90,34 @@ def get_plot_granularity() -> dict:
         "detail_chapter_chars": _int("detail_chapter_chars", 300, 50, 5000),
         "compress_block_chapters": _int("compress_block_chapters", 60, 1, 500),
     }
+
+
+def get_write_options() -> dict:
+    """正文写作选项（篇幅控制与自动续写）；缺项或非法值一律回退默认值
+
+    背景：模型单次输出常常明显短于目标字数（实测某章目标 19500 字只写了 7063 字，
+    且是自然收尾而非被截断），因此除提示词给出篇幅节奏外，还需"不足就接着写"的兜底。
+    """
+    cfg = load_config() or {}
+    raw = cfg.get("write") or {}
+
+    def _num(key, default, lo, hi, cast=float):
+        try:
+            value = cast(raw.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return min(max(value, lo), hi)
+
+    auto = raw.get("auto_continue", True)
+    if isinstance(auto, str):
+        auto = auto.strip().lower() not in ("0", "false", "no", "off", "")
+
+    return {
+        "auto_continue": bool(auto),
+        # 低于目标字数的该比例即触发续写（0.9 对应提示词里的"误差不超过10%"）
+        "min_ratio": _num("min_ratio", 0.9, 0.3, 1.5),
+        "max_continuations": int(_num("max_continuations", 8, 0, 50, int)),
+        "continuation_tail_chars": int(_num("continuation_tail_chars", 800, 100, 5000, int)),
+        # 目标字数小于该值时不强制篇幅（避免短章被反复续写）
+        "min_target_to_enforce": int(_num("min_target_to_enforce", 4000, 0, 100000, int)),
+    }

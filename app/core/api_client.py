@@ -29,8 +29,12 @@ class APIClient:
         self._reload_config()
 
     async def chat(self, user_message: str, system_prompt: str = None,
-                   temperature: float = None, max_tokens: int = None) -> str:
-        """发送聊天请求，返回AI回复文本"""
+                   temperature: float = None, max_tokens: int = None,
+                   stats: dict = None) -> str:
+        """发送聊天请求，返回AI回复文本
+
+        stats：可选字典，用于回传 finish_reason / usage（判断是否因长度被截断）
+        """
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -56,11 +60,19 @@ class APIClient:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            if stats is not None:
+                choice = (data.get("choices") or [{}])[0]
+                stats["finish_reason"] = choice.get("finish_reason", "")
+                stats["usage"] = data.get("usage") or {}
             return data["choices"][0]["message"]["content"]
 
     async def chat_stream(self, user_message: str, system_prompt: str = None,
-                          temperature: float = None, max_tokens: int = None):
-        """流式聊天请求，yield每个token"""
+                          temperature: float = None, max_tokens: int = None,
+                          stats: dict = None):
+        """流式聊天请求，yield每个token
+
+        stats：可选字典，用于回传 finish_reason（"length" 表示被输出上限截断）
+        """
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -93,7 +105,10 @@ class APIClient:
                         import json
                         try:
                             chunk = json.loads(line)
-                            delta = chunk["choices"][0].get("delta", {})
+                            choice = (chunk.get("choices") or [{}])[0]
+                            if stats is not None and choice.get("finish_reason"):
+                                stats["finish_reason"] = choice.get("finish_reason")
+                            delta = choice.get("delta", {})
                             content = delta.get("content", "")
                             if content:
                                 yield content

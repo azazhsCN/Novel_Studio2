@@ -158,12 +158,16 @@ def build_writing_prompt(project: NovelProject, chapter_plan: dict,
 
     parts.append(f"# 写作任务\n{meta_line}")
 
-    # 核心情节（精简列表）
+    # 核心情节（长章给出每个要点的字数预算，模型更容易写足篇幅）
     core_plot = chapter_plan.get("core_plot", [])
     if core_plot:
         parts.append("\n## 核心情节")
+        per_item = max(500, word_target // max(len(core_plot), 1))
         for plot in core_plot:
-            parts.append(f"- {plot}")
+            if word_target >= 6000:
+                parts.append(f"- {plot}（此要点请写足约{per_item}字）")
+            else:
+                parts.append(f"- {plot}")
 
     # 写作提示（只保留纯写作指导，去除可能的元信息重复）
     prompt_text = chapter_plan.get('prompt', '')
@@ -173,13 +177,18 @@ def build_writing_prompt(project: NovelProject, chapter_plan: dict,
     # 上一章内容
     parts.append(f"\n## 上一章内容（供衔接参考）\n{last_chapter_content}\n")
 
-    parts.append(f"""
+    lower = int(word_target * 0.9)
+    length_block = f"""
 ## 要求
 - 直接输出正文，不要输出标题、章节号等元信息
-- 目标字数{word_target}字左右，误差不超过10%
+- **篇幅：约{word_target}字（不得少于{lower}字）**；宁可把细节写足，也不要提前收尾
 - 保持人物性格一致，注意与上一章衔接
-- 第一人称/第三人称按文风设定
-""")
+- 第一人称/第三人称按文风设定"""
+    if word_target >= 6000:
+        length_block += f"""
+- 按上面的"核心情节"逐条展开，每条都要写到，不要合并或跳过
+- 写完后自查字数：不足{lower}字时，继续扩写对话、动作、心理与环境细节，不要用一段总结草草收尾"""
+    parts.append(length_block + "\n")
 
     return "\n".join(parts)
 
@@ -217,16 +226,39 @@ def build_revision_prompt(project: NovelProject, original_content: str,
 
 ## 章节规划参考
 - 标题：{chapter_plan.get('title', '')}
-- 目标字数：{chapter_plan.get('word_count_target', project.base_word_count)}字
+- 目标字数：{chapter_plan.get('word_count_target', project.base_word_count)}字（请写足，不要压缩篇幅）
 
 ## 要求
 1. 根据修改意见重新生成本章内容
 2. 保持与原章节的整体框架一致
 3. 只修改需要调整的部分，不要大幅改变剧情走向
-4. 直接输出修改后的完整章节内容
+4. 直接输出修改后的完整章节内容，**不要遗漏后半部分、不要提前收尾**
 """)
 
     return "\n".join(parts)
+
+
+def build_write_continuation_prompt(project: NovelProject, chapter_plan: dict,
+                                    written: str, remaining: int,
+                                    tail_chars: int = 800) -> str:
+    """续写提示词：单次生成不足目标字数时，接着已写内容继续写（不重复）"""
+    ch_num = chapter_plan.get("chapter_number", "?")
+    title = chapter_plan.get("title", "")
+    target = chapter_plan.get("word_count_target", project.base_word_count)
+    tail = written[-tail_chars:] if tail_chars and len(written) > tail_chars else written
+    return f"""你在续写同一章小说，请**紧接着下面的内容继续往下写**，不要重写、不要重复已有情节。
+
+# 本章信息
+第{ch_num}章《{title}》| 目标{target}字 | 已写约{len(written)}字 | 还需约{max(remaining, 0)}字
+
+# 已写内容的结尾（仅用于衔接，不要重复输出）
+...{tail}
+
+# 要求
+- 只输出续写的正文，不要标题、章节号、总结或说明文字
+- 直接从下一句开始，不要复述上面的内容
+- 保持人称、文风、时间线与情节连贯
+- 还需约{max(remaining, 0)}字；若情节确实已到本章结局，用一两句话自然收束即可"""
 
 
 def build_audit_prompt(project: NovelProject, chapter_content: str,

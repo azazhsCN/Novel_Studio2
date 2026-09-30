@@ -28,3 +28,11 @@ novel:
     detail_batch_size: 5                   # 详细档每批送几章（越小越精细、调用次数越多）
     detail_chapter_chars: 300              # 每章详细摘要目标字数上限
     compress_block_chapters: 60            # 压缩档每段最多覆盖多少章
+
+# 正文写作（篇幅控制）：模型单次输出常短于目标字数，不足时自动续写补齐
+write:
+  auto_continue: true                      # 是否自动续写补齐篇幅
+  min_ratio: 0.9                           # 低于目标的该比例即续写（0.9 对应"误差不超过10%"）
+  max_continuations: 8                     # 单章最多续写轮数（防止无限写下去）
+  continuation_tail_chars: 800             # 续写时携带的已写结尾字数（用于衔接）
+  min_target_to_enforce: 4000              # 目标字数低于该值时不强制篇幅

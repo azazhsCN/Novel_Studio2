@@ -277,7 +277,7 @@ async function apiStream(path, options, onToken, onDone) {
                 let event;
                 try { event = JSON.parse(line.slice(6)); } catch (e) { continue; }
                 if (event.type === 'token' && onToken) onToken(event.content);
-                else if (event.type === 'done' && onDone) { gotDone = true; onDone(event.chapter); }
+                else if (event.type === 'done' && onDone) { gotDone = true; onDone(event.chapter, event); }
                 else if (event.type === 'error') throw new Error(event.message || '生成中断');
             }
         }
@@ -286,7 +286,7 @@ async function apiStream(path, options, onToken, onDone) {
         if (tail.startsWith('data: ')) {
             let event;
             try { event = JSON.parse(tail.slice(6)); } catch (e) { event = null; }
-            if (event && event.type === 'done' && onDone) { gotDone = true; onDone(event.chapter); }
+            if (event && event.type === 'done' && onDone) { gotDone = true; onDone(event.chapter, event); }
             else if (event && event.type === 'error') throw new Error(event.message || '生成中断');
         }
     } catch (e) {
@@ -307,6 +307,25 @@ function toast(msg, type = 'info') {
     t.textContent = msg;
     c.appendChild(t);
     setTimeout(() => t.remove(), 4000);
+}
+
+// 篇幅提示：生成结果明显短于目标时给出可见反馈（此前只看字数无法判断是否达标）
+function lengthNotice(prefix, ev) {
+    const target = ev && ev.target_words;
+    const final = ev && ev.final_words;
+    if (!target || !final) return prefix + '！';
+    const pct = Math.round(final / target * 100);
+    const extra = ev.passes > 1 ? `，续写${ev.passes - 1}轮` : '';
+    if (final < target * 0.9) {
+        return `${prefix}：${final}/${target}字（${pct}%${extra}）—— 仍不足目标，可再点「重新生成」，或在修改意见里要求扩写`;
+    }
+    return `${prefix}：${final}/${target}字（${pct}%${extra}）`;
+}
+
+function lengthNoticeType(ev) {
+    const target = ev && ev.target_words;
+    const final = ev && ev.final_words;
+    return (target && final && final < target * 0.9) ? 'info' : 'success';
 }
 
 // ========== Loading Overlay ==========
@@ -1150,7 +1169,7 @@ async function doWriteInWorkspace() {
             `/api/novels/${currentNovelId}/chapters/write/stream`,
             { method: 'POST', body: JSON.stringify({ chapter_number: writingSelectedPlan }) },
             (token) => appendStreamToken(outputEl, token),
-            (chapter) => {
+            (chapter, ev) => {
                 writingIsStreaming = false;
                 writingChapterFinalized = false;
                 renderWritingActions(false);
@@ -1160,7 +1179,7 @@ async function doWriteInWorkspace() {
                     document.getElementById('writingEditText').value = writingStreamContent;
                     applyEditModeUI();
                 }
-                toast('章节生成完成！', 'success');
+                toast(lengthNotice('章节生成完成', ev), lengthNoticeType(ev));
             }
         );
     } catch (e) {
@@ -1188,7 +1207,7 @@ async function doReviseInWorkspace() {
             `/api/novels/${currentNovelId}/chapters/${writingSelectedPlan}/revise/stream`,
             { method: 'POST', body: JSON.stringify({ revision意见: opinion }) },
             (token) => appendStreamToken(outputEl, token),
-            (chapter) => {
+            (chapter, ev) => {
                 writingIsStreaming = false;
                 writingChapterFinalized = false;
                 document.getElementById('writingReviseInput').value = '';
@@ -1197,7 +1216,7 @@ async function doReviseInWorkspace() {
                     document.getElementById('writingEditText').value = writingStreamContent;
                     applyEditModeUI();
                 }
-                toast('修改完成！', 'success');
+                toast(lengthNotice('修改完成', ev), lengthNoticeType(ev));
             }
         );
     } catch (e) {
@@ -1277,7 +1296,7 @@ async function doAIAdjustInWorkspace() {
             `/api/novels/${currentNovelId}/chapters/${writingSelectedPlan}/revise/stream`,
             { method: 'POST', body: JSON.stringify({ revision意见: `在保持整体剧情和结构不变的前提下，进行以下调整：${opinion}` }) },
             (token) => appendStreamToken(outputEl, token),
-            (chapter) => {
+            (chapter, ev) => {
                 writingIsStreaming = false;
                 writingChapterFinalized = false;
                 document.getElementById('writingReviseInput').value = '';
@@ -1286,7 +1305,7 @@ async function doAIAdjustInWorkspace() {
                     document.getElementById('writingEditText').value = writingStreamContent;
                     applyEditModeUI();
                 }
-                toast('AI调整完成！', 'success');
+                toast(lengthNotice('AI调整完成', ev), lengthNoticeType(ev));
             }
         );
     } catch (e) {
