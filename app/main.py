@@ -9,6 +9,9 @@ from pathlib import Path
 
 from app.api import novels, chapters, audit
 
+# 版本号单一来源：前端侧边栏、FastAPI 元数据与 /api/health 三处保持一致
+APP_VERSION = "26.9.30"
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -16,7 +19,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-app = FastAPI(title="Novel_Studio2", version="1.0.0")
+app = FastAPI(title="Novel_Studio2", version=APP_VERSION)
 
 # CORS
 app.add_middleware(
@@ -43,4 +46,4 @@ async def index(request: Request):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": APP_VERSION}
