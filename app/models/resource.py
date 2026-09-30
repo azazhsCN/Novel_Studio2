@@ -2,8 +2,11 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 import json
+import logging
 from app.core.config import get_novel_subdirs
-from app.core.storage import backup_file
+from app.core.storage import backup_file, quarantine_corrupt_file
+
+logger = logging.getLogger(__name__)
 
 # 首选的资源分类（键 → 中文名）。历史数据里出现过模型外分类（如 skill、system_character），
 # 一律保留并展示，不做静默丢弃；顺序即前端展示顺序。
@@ -13,6 +16,16 @@ RESOURCE_CATEGORIES = {
     "system": "系统/数值",
     "character_status": "人物状态",
     "foreshadow": "伏笔/悬念",
+}
+
+# 审计检测的 6 类冲突（键 → 中文名，顺序即报告顺序）。报告中的"通过项"= 未被命中的类型。
+CONFLICT_TYPES = {
+    "timeline": "时间线冲突",
+    "character": "人物状态冲突",
+    "item": "物品冲突",
+    "setting": "设定冲突",
+    "value": "数值冲突",
+    "foreshadow": "伏笔冲突",
 }
 
 
@@ -61,7 +74,13 @@ class ResourceTracker(BaseModel):
         path = dirs["base"] / "resources.json"
         if not path.exists():
             return cls(novel_id=novel_id)
-        return cls.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return cls.model_validate_json(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as e:
+            # 资源表损坏：隔离留证并退化为空表，不再让每次审计/报告都 500
+            logger.error(f"资源表损坏，已隔离 {path.name}: {e}")
+            quarantine_corrupt_file(path)
+            return cls(novel_id=novel_id)
 
     def add_resource(self, item: ResourceItem):
         """按 (category, name) 字段级合并

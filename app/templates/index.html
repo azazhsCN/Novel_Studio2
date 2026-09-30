@@ -659,10 +659,15 @@ async function loadPromptEditor() {
             <div class="card">
                 <div class="card-header">
                     剧情概述
-                    <span style="color:var(--text2);font-size:12px;">${(data.plot_overview || '').length}字</span>
+                    <span style="color:var(--text2);font-size:12px;">${(data.plot_overview || '').length}字 / ${(data.plot_segments || []).length} 段</span>
                 </div>
                 <div class="card-body">
                     <textarea class="form-control" id="prompt-plot" rows="10">${escapeHtml(data.plot_overview)}</textarea>
+                    <div style="margin-top:8px;">
+                        <label style="font-size:13px;color:var(--text2);">关键章节锁定（这些章节的剧情摘要永远单独保存、不参与压缩；用逗号或空格分隔章节号）</label>
+                        <input class="form-control" id="prompt-locked" placeholder="例如：3, 12, 25"
+                               value="${escapeHtml((data.locked_chapters || []).join(', '))}">
+                    </div>
                 </div>
             </div>
 
@@ -824,11 +829,17 @@ async function savePrompt() {
         const plot = document.getElementById('prompt-plot');
         const style = document.getElementById('prompt-style');
         const dir = document.getElementById('prompt-direction');
+        const lockedEl = document.getElementById('prompt-locked');
 
         if (!basic || !plot) {
             toast('页面元素未加载，请稍后再试', 'error');
             return;
         }
+
+        const lockedChapters = (lockedEl ? lockedEl.value : '')
+            .split(/[，,\s]+/)
+            .map(s => parseInt(s, 10))
+            .filter(n => Number.isInteger(n) && n > 0);
 
         const payload = {
             basic_setting: basic.value,
@@ -836,6 +847,7 @@ async function savePrompt() {
             plot_overview: plot.value,
             writing_style: style ? style.value : '',
             continuation_direction: dir ? dir.value : '',
+            locked_chapters: lockedChapters,
         };
 
         const resp = await fetch(`/api/novels/${currentNovelId}/core-prompt`, {
@@ -890,6 +902,19 @@ async function loadAuditPanel() {
             html += `<div class="card"><div class="card-header">${escapeHtml(catLabel)}</div><div class="card-body">${tableHtml}</div></div>`;
         }
 
+        // 已通过审计的章节（报告"通过项"）
+        const passedItems = data.passed_items || [];
+        if (passedItems.length) {
+            html += `<div class="card"><div class="card-header" style="color:var(--success)">已通过审计的章节（通过项）</div><div class="card-body">`;
+            for (const it of passedItems) {
+                html += `<div style="margin-bottom:8px;">
+                    <strong>第${it.chapter_number}章</strong> ${escapeHtml(it.title || '')}
+                    <div style="font-size:12px;color:var(--text2);">通过项：${escapeHtml((it.passed_checks || []).join('、') || '—')}</div>
+                </div>`;
+            }
+            html += '</div></div>';
+        }
+
         // Unresolved conflicts (markdown rendering)
         const conflicts = data.unresolved_conflicts || [];
         if (conflicts.length) {
@@ -902,9 +927,10 @@ async function loadAuditPanel() {
                 md += `> 建议：${escapeHtml(c.suggestion)}\n`;
                 html += `<div class="conflict-item">
                     <div class="markdown-body">${renderMarkdown(md)}</div>
-                    <div style="margin-top:8px;">
+                    <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
                         <button class="btn btn-sm btn-secondary" title="标记为误报" data-action="resolveConflict" data-index="${idx}" data-resolution="ignore">忽略</button>
-                        <button class="btn btn-sm btn-warning" title="标记为已手动更新" data-action="resolveConflict" data-index="${idx}" data-resolution="update_resource">更新资源表</button>
+                        <button class="btn btn-sm btn-warning" title="我已在上方资源表中手动修正，标记为已处理" data-action="resolveConflict" data-index="${idx}" data-resolution="update_resource">更新资源表</button>
+                        <button class="btn btn-sm btn-info" title="跳到写作工作台修改本章，并标记该冲突为已处理" data-action="modifyChapterForConflict" data-index="${idx}" data-chapter="${c.chapter_number}">修改章节</button>
                     </div>
                 </div>`;
             }
@@ -1300,6 +1326,10 @@ async function doAuditInWorkspace() {
         } else {
             md += `> 未发现冲突\n`;
         }
+        if (result.passed_checks && result.passed_checks.length) {
+            md += `\n### 通过项（${result.passed_checks.length} 项）\n\n`;
+            for (const p of result.passed_checks) md += `- ${escapeHtml(p)}\n`;
+        }
         showModal('审计报告', `<div class="markdown-body">${renderMarkdown(md)}</div>`,
             '<button class="btn btn-secondary" data-action="closeModal">关闭</button>');
     } catch (e) { toast(e.message, 'error'); }
@@ -1678,6 +1708,11 @@ async function runAudit(chapterNumber) {
         } else {
             html += '<div style="color:var(--success);text-align:center;padding:20px;">未发现冲突</div>';
         }
+        if (result.passed_checks && result.passed_checks.length) {
+            html += `<h3 style="margin-top:16px;margin-bottom:12px;color:var(--success);">通过项（${result.passed_checks.length} 项）</h3>`
+                + '<ul style="padding-left:20px;color:var(--text2);">'
+                + result.passed_checks.map(x => `<li>${escapeHtml(x)}</li>`).join('') + '</ul>';
+        }
         if (result.resource_changes && result.resource_changes.length) {
             html += '<h3 style="margin-top:16px;margin-bottom:12px;">资源变动</h3><table class="table"><tr><th>类型</th><th>名称</th><th>值</th><th>操作</th></tr>';
             for (const rc of result.resource_changes) {
@@ -1702,6 +1737,12 @@ async function resolveConflict(index, resolution) {
         toast('冲突已解决', 'success');
         await loadAuditPanel();
     } catch (e) { toast(e.message, 'error'); }
+}
+
+// 处置三选项之"修改章节"：标记冲突已处理，并跳到写作工作台改稿
+async function modifyChapterForConflict(index, chapterNumber) {
+    await resolveConflict(index, 'modify_chapter');
+    switchToWritingForChapter(chapterNumber);
 }
 
 async function editResource(category, index) {
@@ -1800,6 +1841,7 @@ const ACTION_HANDLERS = {
     removeCharCard: (el, e) => { e.stopPropagation(); removeCharCard(+el.dataset.charIndex); },
     // 审计
     resolveConflict: (el) => resolveConflict(+el.dataset.index, el.dataset.resolution),
+    modifyChapterForConflict: (el) => modifyChapterForConflict(+el.dataset.index, +el.dataset.chapter),
     editResource: (el) => editResource(el.dataset.category, +el.dataset.index),
     deleteResource: (el) => deleteResource(el.dataset.category, +el.dataset.index),
     saveResource: (el) => saveResource(el.dataset.category, +el.dataset.index),

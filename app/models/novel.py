@@ -39,6 +39,7 @@ class CorePromptModules(BaseModel):
     plot_segments: list[PlotSegment] = []  # 分段缓存，用于增量更新
     writing_style: str = ""          # 文风设定：视角、语言、描写特点
     continuation_direction: str = "" # 续写方向：当前走向、冲突线索
+    locked_chapters: list[int] = []  # 关键章节：其摘要永不被压缩（需求 3.2）
 
 
 class NovelProject(BaseModel):
@@ -78,7 +79,13 @@ class NovelProject(BaseModel):
         path = get_novel_dir(novel_id) / "project.json"
         if not path.exists():
             return None
-        return cls.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return cls.model_validate_json(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as e:
+            # 损坏的项目文件隔离留证，不让单个坏文件把接口打成 500
+            logger.error(f"项目文件损坏，已隔离 {path.name}: {e}")
+            quarantine_corrupt_file(path)
+            return None
 
     @classmethod
     def list_all(cls) -> list["NovelProject"]:

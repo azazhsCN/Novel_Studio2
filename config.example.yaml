@@ -20,3 +20,11 @@ novel:
   default_base_word_count: 3000            # 默认每章字数
   key_chapter_ratio: 1.3                   # 重点章节字数倍率
   turning_chapter_ratio: 1.5               # 转折章节字数倍率
+  # 剧情概述颗粒度（需求 3.2；缺项按默认值处理）
+  plot_granularity:
+    detail_max_chapters: 50                # ≤该章数：每章详细摘要（200-300 字/章）
+    mid_max_chapters: 150                  # ≤该章数：早期压缩为一段；超过则早期压缩为一句话
+    recent_detail_count: 20                # 最近 N 章始终保留详细摘要
+    detail_batch_size: 5                   # 详细档每批送几章（越小越精细、调用次数越多）
+    detail_chapter_chars: 300              # 每章详细摘要目标字数上限
+    compress_block_chapters: 60            # 压缩档每段最多覆盖多少章

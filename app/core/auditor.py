@@ -1,6 +1,7 @@
 """审计系统模块
 负责资源追踪、冲突检测、审计报告生成
 """
+from datetime import datetime
 from fastapi import HTTPException
 from app.core.api_client import api_client
 from app.core.prompt_builder import build_audit_prompt
@@ -8,7 +9,7 @@ from app.core.importer import _extract_json
 from app.models.novel import NovelProject
 from app.models.chapter import Chapter
 from app.models.resource import (
-    ResourceTracker, ResourceItem, AuditConflict, RESOURCE_CATEGORIES,
+    ResourceTracker, ResourceItem, AuditConflict, RESOURCE_CATEGORIES, CONFLICT_TYPES,
 )
 
 
@@ -69,9 +70,15 @@ async def audit_chapter(project: NovelProject, chapter: Chapter) -> dict:
 
     tracker.save()
 
-    # 标记审计状态
+    # 标记审计状态，并记录"通过项"（6 类检测中未被命中者）
     has_conflicts = len(conflicts) > 0
+    triggered = {c.conflict_type for c in conflicts}
+    passed_checks = [label for key, label in CONFLICT_TYPES.items() if key not in triggered]
     chapter.audit_passed = not has_conflicts
+    chapter.audit_summary = result.get("summary", "")
+    chapter.audit_conflict_types = sorted(triggered)
+    chapter.audit_passed_checks = passed_checks
+    chapter.audited_at = datetime.now().isoformat()
     chapter.save()
 
     return {
@@ -79,6 +86,7 @@ async def audit_chapter(project: NovelProject, chapter: Chapter) -> dict:
         "conflicts": [c.model_dump() for c in conflicts],
         "resource_changes": resource_changes,
         "has_conflicts": has_conflicts,
+        "passed_checks": passed_checks,
         "summary": result.get("summary", ""),
     }
 
@@ -125,9 +133,23 @@ async def get_audit_report(novel_id: str) -> dict:
         resources[cat_key] = grouped[cat_key]
         resource_category_labels[cat_key] = f"{cat_key}（未归类）"
 
+    # 已通过审计的章节及其通过项（需求 3.7：报告需包含"通过项"）
+    passed_items = []
+    for ch in Chapter.list_for_novel(novel_id):
+        if ch.audited_at and ch.audit_passed:
+            passed_items.append({
+                "chapter_number": ch.chapter_number,
+                "title": ch.title,
+                "summary": ch.audit_summary,
+                "passed_checks": ch.audit_passed_checks,
+                "audited_at": ch.audited_at,
+            })
+
     return {
         "resources": resources,
         "resource_category_labels": resource_category_labels,
+        "conflict_type_labels": CONFLICT_TYPES,
+        "passed_items": passed_items,
         "unresolved_conflicts": unresolved_with_index,
         "total_resources": len(tracker.resources),
         "total_conflicts": len(tracker.conflicts),

@@ -1,10 +1,13 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
+from pathlib import Path
 import json
 import logging
-from app.core.config import get_novel_subdirs, validate_plan_id
-from app.core.storage import sanitize_filename, backup_file, quarantine_corrupt_file
+from app.core.config import get_novel_subdirs, validate_plan_id, DATA_DIR
+from app.core.storage import (
+    sanitize_filename, backup_file, quarantine_corrupt_file, move_to_trash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,8 @@ class ChapterBatchPlan(BaseModel):
         path = dirs["plans"] / f"{self.id}.json"
         tmp = path.with_suffix('.json.tmp')
         tmp.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        if path.exists():
+            backup_file(path)  # 覆盖前保留历史版本
         tmp.replace(path)
 
     @classmethod
@@ -68,10 +73,11 @@ class ChapterBatchPlan(BaseModel):
         return sorted(plans, key=lambda x: x.start_chapter)
 
     def delete(self):
+        """删除规划：移入回收站而非直接删除（删除必须可恢复）"""
         dirs = get_novel_subdirs(self.novel_id)
         path = dirs["plans"] / f"{self.id}.json"
         if path.exists():
-            path.unlink()
+            move_to_trash(path, DATA_DIR / ".trash")
 
 
 class Chapter(BaseModel):
@@ -84,6 +90,11 @@ class Chapter(BaseModel):
     word_count: int = 0
     is_finalized: bool = False  # 是否已定稿
     audit_passed: bool = False  # 审计是否通过
+    # 最近一次审计的结果（供审计报告展示"通过项/需确认项"）
+    audit_summary: str = ""
+    audit_conflict_types: list[str] = []
+    audit_passed_checks: list[str] = []
+    audited_at: str = ""
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
 
@@ -117,10 +128,10 @@ class Chapter(BaseModel):
             backup_file(meta_path)
         tmp_meta.replace(meta_path)
 
-        # 清理旧标题的txt文件（跳过备份文件）
+        # 标题变更后清理旧的正文文件：移入回收站，避免直接删除造成不可恢复
         for old in chapters_dir.glob(f"第{self.chapter_number:04d}章_*.txt"):
             if old.name != filename:
-                old.unlink(missing_ok=True)
+                move_to_trash(old, DATA_DIR / ".trash")
 
     @classmethod
     def load(cls, novel_id: str, chapter_number: int) -> Optional["Chapter"]:
@@ -128,12 +139,34 @@ class Chapter(BaseModel):
         meta_path = dirs["chapters"] / f"第{chapter_number:04d}章_meta.json"
         if not meta_path.exists():
             return None
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            # 损坏的元数据隔离留证，不让单章坏文件把接口打成 500
+            logger.error(f"章节元数据损坏，已隔离 {meta_path.name}: {e}")
+            quarantine_corrupt_file(meta_path)
+            return None
         # 加载txt内容
-        txt_files = list(dirs["chapters"].glob(f"第{chapter_number:04d}章_*.txt"))
-        if txt_files:
-            meta["content"] = txt_files[0].read_text(encoding="utf-8")
+        meta["content"] = cls._read_chapter_text(
+            dirs["chapters"], chapter_number, meta.get("title", "")
+        )
         return cls(**meta)
+
+    @staticmethod
+    def _read_chapter_text(chapters_dir: Path, chapter_number: int, title: str = "") -> str:
+        """读取章节正文：优先精确匹配标题，避免标题变更后残留旧稿被误读"""
+        if title:
+            exact = chapters_dir / f"第{chapter_number:04d}章_{sanitize_filename(title)}.txt"
+            if exact.exists():
+                return exact.read_text(encoding="utf-8")
+        txt_files = sorted(chapters_dir.glob(f"第{chapter_number:04d}章_*.txt"))
+        if not txt_files:
+            return ""
+        if len(txt_files) > 1:
+            logger.warning(
+                f"第{chapter_number}章存在 {len(txt_files)} 个正文文件，读取 {txt_files[0].name}"
+            )
+        return txt_files[0].read_text(encoding="utf-8")
 
     @classmethod
     def list_for_novel(cls, novel_id: str, load_content: bool = False) -> list["Chapter"]:
@@ -144,10 +177,9 @@ class Chapter(BaseModel):
             try:
                 meta = json.loads(f.read_text(encoding="utf-8"))
                 if load_content:
-                    ch_num = meta.get("chapter_number", 0)
-                    txt_files = list(dirs["chapters"].glob(f"第{ch_num:04d}章_*.txt"))
-                    if txt_files:
-                        meta["content"] = txt_files[0].read_text(encoding="utf-8")
+                    meta["content"] = cls._read_chapter_text(
+                        dirs["chapters"], meta.get("chapter_number", 0), meta.get("title", "")
+                    )
                 chapters.append(cls(**meta))
             except Exception as e:
                 # 不静默吞掉：隔离坏文件并记日志，避免章节"凭空消失"无感知

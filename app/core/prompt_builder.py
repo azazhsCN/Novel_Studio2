@@ -129,6 +129,7 @@ def build_writing_prompt(project: NovelProject, chapter_plan: dict,
     parts.append(build_system_prompt(project))
     parts.append(build_character_prompt(project))
     parts.append(build_plot_overview_prompt(project))
+    parts.append(build_continuation_prompt(project))
 
     # 资源追踪状态（审计用）
     if resource_summary:
@@ -184,12 +185,26 @@ def build_writing_prompt(project: NovelProject, chapter_plan: dict,
 
 
 def build_revision_prompt(project: NovelProject, original_content: str,
-                          revision意见: str, chapter_plan: dict) -> str:
-    """构建修改重写的提示词"""
+                          revision意见: str, chapter_plan: dict,
+                          style_sample: str = "",
+                          resource_summary: str = "") -> str:
+    """构建修改重写的提示词
+
+    与首写提示词保持同等上下文：剧情概述、续写方向、文风样本、资源状态都要带上，
+    否则多轮改写后剧情与文风会逐步漂移。
+    """
     parts = []
 
     parts.append(build_system_prompt(project))
     parts.append(build_character_prompt(project))
+    parts.append(build_plot_overview_prompt(project))
+    parts.append(build_continuation_prompt(project))
+
+    if resource_summary:
+        parts.append(resource_summary)
+
+    if style_sample:
+        parts.append(f"# 文风参考样本\n{style_sample}\n")
 
     parts.append(f"""
 # 章节修改任务
@@ -335,3 +350,55 @@ def build_import_analysis_prompt(novel_text: str) -> str:
 }}
 ```
 """
+
+
+def build_plot_detail_prompt(chapters_text: str, chapter_numbers: list[int],
+                             old_overview: str = "", target_chars: int = 300) -> str:
+    """逐章详细摘要提示词（需求 3.2：0-50 章每章 200-300 字）"""
+    nums_label = "、".join(f"第{n}章" for n in chapter_numbers)
+    low = max(50, int(target_chars * 0.7))
+    return f"""你是一个小说剧情概述专家。请为以下章节**逐章**撰写详细摘要。
+
+# 章节内容（{nums_label}）
+{chapters_text}
+
+# 输出要求
+- 每章单独一节，标题格式严格为：### 第X章：本章主题（X 必须是真实章节号）
+- 每章摘要 {low}-{int(target_chars)} 字，密集叙事体，连贯叙事而非逐条罗列
+- 保留所有关键细节：人名、具体行为、数值、技能名称、人物状态变化、伏笔
+- 不要合并章节、不要改写章节号、不要输出前导说明或解释性文字
+- 给定的每一章都要有输出，一个都不能漏"""
+
+
+def build_plot_compress_prompt(range_label: str, source_text: str,
+                              old_overview: str = "") -> str:
+    """早期章节压缩为一段的提示词（50-150 章档）"""
+    return f"""你是一个小说剧情概述专家。请把以下内容压缩成**一段**连贯的剧情概述。
+
+# 当前剧情概述（参考）
+{old_overview}
+
+# 待压缩内容（{range_label}）
+{source_text}
+
+# 输出要求
+- 只输出一段正文（若干句，必须连贯），不要分小节、不要加任何标题
+- 保留贯穿性关键信息：主要人物、关键事件与转折、重要伏笔及其回收
+- 直接输出正文，不要前导说明、问候语"""
+
+
+def build_plot_one_liner_prompt(range_label: str, source_text: str,
+                                old_overview: str = "") -> str:
+    """早期章节压缩为一句话的提示词（150+ 章档）"""
+    return f"""你是一个小说剧情概述专家。请用**一句话**概括以下内容。
+
+# 当前剧情概述（参考）
+{old_overview}
+
+# 待压缩内容（{range_label}）
+{source_text}
+
+# 输出要求
+- 只输出一句话，不超过 80 字，不要标题、不要分点、不要换行
+- 抓住这段剧情的核心走向与结果
+- 直接输出正文，不要前导说明"""

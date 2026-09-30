@@ -1,8 +1,11 @@
 """文件存储工具：文件名消毒、备份轮转、回收站移动"""
+import logging
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Windows/跨平台文件名非法字符与控制字符
 _INVALID_FILENAME_CHARS = re.compile(r'[\x00-\x1f]')
@@ -33,16 +36,24 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
 
 
 def backup_file(path: Path, keep: int = 2) -> None:
-    """覆盖写之前把现有文件轮转为 .bak（保留最近 keep 份）"""
+    """覆盖写之前轮转备份：最新一份是 .bak，更早的依次是 .bak1、.bak2……
+
+    此前轮转时读的是 .bak{i}（.bak1 永远不存在），导致 keep 参数形同虚设，
+    实际只保留了 1 份备份。
+    """
     if not path.exists():
         return
-    # 旧备份逐级轮转：.bak{i+1} ← .bak{i}
+    if keep <= 1:
+        shutil.copy2(str(path), str(path.with_name(f"{path.name}.bak")))
+        return
+    # 超出保留份数的旧备份先丢弃，再整体后移一位：.bak{i-1} → .bak{i}，.bak → .bak1
+    oldest = path.with_name(f"{path.name}.bak{keep - 1}")
+    if oldest.exists():
+        oldest.unlink()
     for i in range(keep - 1, 0, -1):
-        src = path.with_name(f"{path.name}.bak{i}")
-        dst = path.with_name(f"{path.name}.bak{i + 1}")
+        src = path.with_name(f"{path.name}.bak" if i == 1 else f"{path.name}.bak{i - 1}")
+        dst = path.with_name(f"{path.name}.bak{i}")
         if src.exists():
-            if dst.exists():
-                dst.unlink()
             shutil.move(str(src), str(dst))
     # 当前文件复制为最新备份
     shutil.copy2(str(path), str(path.with_name(f"{path.name}.bak")))
@@ -69,5 +80,7 @@ def quarantine_corrupt_file(path: Path) -> None:
     target = path.with_name(f"{path.name}.corrupt-{ts}")
     try:
         path.rename(target)
-    except OSError:
-        pass
+        logger.warning(f"损坏文件已隔离: {path.name} → {target.name}")
+    except OSError as e:
+        # 隔离失败也不能静默（AGENTS.md 明确禁止 except: pass）
+        logger.error(f"隔离损坏文件失败 {path}: {e}")

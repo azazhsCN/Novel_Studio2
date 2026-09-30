@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from app.models.novel import NovelProject, CorePromptModules, CharacterCard
 from app.core.config import validate_novel_id
+from app.core.storage import sanitize_filename, backup_file
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class CorePromptUpdateRequest(BaseModel):
     plot_overview: Optional[str] = None
     writing_style: Optional[str] = None
     continuation_direction: Optional[str] = None
+    locked_chapters: Optional[list[int]] = None  # 关键章节：其剧情摘要永不被压缩
 
 
 class ImportRequest(BaseModel):
@@ -161,13 +163,18 @@ async def update_core_prompt(novel_id: str, req: CorePromptUpdateRequest):
             project.core_prompt.basic_setting = req.basic_setting
         if req.character_cards is not None:
             cards = []
+            failed = 0
             for c in req.character_cards:
                 try:
                     if 'first_chapter' in c and (c['first_chapter'] == '' or c['first_chapter'] is None):
                         c['first_chapter'] = 0
                     cards.append(CharacterCard(**c))
                 except Exception as e:
+                    failed += 1
                     logger.warning(f"角色卡片解析失败: {e}")
+            if failed and not cards:
+                # 全部解析失败：不得用空列表覆盖已有卡片（清空卡片应显式提交空数组）
+                raise HTTPException(400, f"{failed} 张角色卡片格式非法，已保留原有卡片")
             project.core_prompt.character_cards = cards
         if req.plot_overview is not None:
             project.core_prompt.plot_overview = req.plot_overview
@@ -175,6 +182,11 @@ async def update_core_prompt(novel_id: str, req: CorePromptUpdateRequest):
             project.core_prompt.writing_style = req.writing_style
         if req.continuation_direction is not None:
             project.core_prompt.continuation_direction = req.continuation_direction
+        if req.locked_chapters is not None:
+            # 关键章节白名单：只接受正整数，去重排序
+            project.core_prompt.locked_chapters = sorted({
+                int(n) for n in req.locked_chapters if isinstance(n, int) and 0 < n <= 100000
+            })
 
         project.save()
         return {"message": "核心提示词更新成功"}
@@ -293,13 +305,18 @@ async def upload_style_sample(novel_id: str, file: UploadFile = File(...)):
     if len(content) > UPLOAD_SIZE_LIMIT:
         raise HTTPException(413, f"文件过大，最大允许{UPLOAD_SIZE_LIMIT // 1024 // 1024}MB")
 
-    # 防止路径遍历：只取文件名部分
-    safe_name = Path(file.filename).name
+    # 防止路径遍历：只取文件名部分，并做非法字符消毒（Windows 非法字符会直接导致写入失败）
+    safe_name = sanitize_filename(Path(file.filename).name)
     if not safe_name:
         raise HTTPException(400, "无效的文件名")
 
     path = dirs["style_samples"] / safe_name
-    path.write_bytes(content)
+    # 原子写 + 覆盖前备份，与项目其它写入路径保持一致
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_bytes(content)
+    if path.exists():
+        backup_file(path)
+    tmp.replace(path)
 
     return {"message": f"文风样本 '{safe_name}' 上传成功"}
 
@@ -313,11 +330,15 @@ async def list_style_samples(novel_id: str):
 
     samples = []
     for f in sorted(samples_dir.iterdir()):
-        if f.is_file():
-            samples.append({
-                "name": f.name,
-                "size": f.stat().st_size,
-            })
+        if not f.is_file():
+            continue
+        # 跳过运行时备份、临时与隔离文件，避免它们出现在样本列表里
+        if ".bak" in f.name or f.name.endswith(".tmp") or ".corrupt-" in f.name:
+            continue
+        samples.append({
+            "name": f.name,
+            "size": f.stat().st_size,
+        })
     return {"samples": samples}
 
 
@@ -508,192 +529,105 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
         project.core_prompt.character_cards = new_cards
 
     if req.scope == "plot_overview" or req.scope == "all":
-        # AI更新剧情概述（增量缓存 + 分段处理）
+        # 按需求 3.2 的分档规则重算剧情概述：
+        #   ≤detail_max 章：逐章详细摘要；≤mid_max 章：早期压缩为一段；
+        #   更多章：早期压缩为一句话 + 中期压缩为一段；锁定章节永远单独成段。
         from app.models.novel import PlotSegment
+        from app.core.config import get_plot_granularity
+        from app.core.plot_granularity import build_segment_plan, split_detail_response, describe_plan
+        from app.core.prompt_builder import (
+            build_plot_detail_prompt, build_plot_compress_prompt, build_plot_one_liner_prompt,
+        )
 
-        old_overview = project.core_prompt.plot_overview or "暂无"
+        gran = get_plot_granularity()
+        locked = set(project.core_prompt.locked_chapters or [])
         cached_segments = project.core_prompt.plot_segments
-        total_chapters = len(chapters)
+        old_overview = project.core_prompt.plot_overview or "暂无"
+        by_num = {ch.chapter_number: ch for ch in chapters}
+        numbers = sorted(by_num)
 
-        # 找出已有缓存覆盖到的最新章节号
-        cached_end = max((s.end_chapter for s in cached_segments), default=0)
+        def _chapter_text(n: int) -> str:
+            ch = by_num[n]
+            return f"第{n}章 {ch.title}:\n{ch.content}"
 
-        # 新章节（未被缓存覆盖的）
-        new_chapters = [ch for ch in chapters if ch.chapter_number > cached_end]
-
-        async def _summarize_new_chapters(new_chs, batch_size, granularity_label):
-            """对新章节全文传入，分批总结"""
-            results = []
-            for i in range(0, len(new_chs), batch_size):
-                batch = new_chs[i:i + batch_size]
-                start_num = batch[0].chapter_number
-                end_num = batch[-1].chapter_number
-                seg_text = "\n\n".join(
-                    f"第{ch.chapter_number}章 {ch.title}:\n{ch.content}"
-                    for ch in batch
-                )
-                prompt = f"""你是一个小说剧情概述专家。请根据以下章节的完整内容，生成剧情概述。
-
-# 章节范围：第{start_num}-{end_num}章（共{len(batch)}章）
-# 章节内容
-{seg_text}
-
-# 概述要求
-{granularity_label}，按以下格式输出：
-
-### 第X-Y章：[阶段主题标题]
-[密集叙事体概述，保留所有关键细节：人名、具体行为、数值、技能名称、人物状态变化。连贯叙事，非逐章摘要。]
-
-# 重要
-- 直接输出概述正文，第一个字就是"###"
-- 不要输出前导说明、问候语
-- 每段之间空一行"""
-
-                response = await api_client.chat(prompt)
-                results.append(PlotSegment(
-                    start_chapter=start_num,
-                    end_chapter=end_num,
-                    summary=_strip_ai_preamble(response),
-                ))
-            return results
-
-        async def _recompress_old_segments(old_segments, batch_size, granularity_label):
-            """对已有缓存摘要进行二次压缩（不重新读取原文）"""
-            results = []
-            for i in range(0, len(old_segments), batch_size):
-                batch = old_segments[i:i + batch_size]
-                start_num = batch[0].start_chapter
-                end_num = batch[-1].end_chapter
-                summaries_text = "\n\n".join(
-                    f"[第{s.start_chapter}-{s.end_chapter}章的概述]\n{s.summary}"
-                    for s in batch
-                )
-                prompt = f"""你是一个小说剧情概述专家。请将以下已有的分段概述合并压缩。
-
-# 已有概述（共{len(batch)}段，覆盖第{start_num}-{end_num}章）
-{summaries_text}
-
-# 压缩要求
-将上述概述合并，{granularity_label}，按以下格式输出：
-
-### 第X-Y章：[阶段主题标题]
-[密集叙事体概述，保留关键细节，不要丢失重要信息。]
-
-# 重要
-- 直接输出概述正文，第一个字就是"###"
-- 不要输出前导说明、问候语"""
-
-                response = await api_client.chat(prompt)
-                results.append(PlotSegment(
-                    start_chapter=start_num,
-                    end_chapter=end_num,
-                    summary=_strip_ai_preamble(response),
-                ))
-            return results
+        # 缓存：单章摘要（锁定章节可复用）与同范围摘要（避免反复二次压缩导致信息衰减）
+        single_cache = {s.start_chapter: s.summary
+                        for s in cached_segments if s.start_chapter == s.end_chapter}
+        range_cache = {(s.start_chapter, s.end_chapter): s.summary for s in cached_segments}
+        plan = build_segment_plan(numbers, locked, gran)
+        logger.info(f"剧情概述分段计划（共{len(numbers)}章）：{describe_plan(plan)}")
 
         try:
-            if total_chapters <= 50:
-                # ≤50章：一次性处理，全文传入
-                all_text_full = "\n\n".join(
-                    f"第{ch.chapter_number}章 {ch.title}:\n{ch.content}"
-                    for ch in chapters
-                )
-                plot_prompt = f"""你是一个小说剧情概述专家。请根据已写章节的完整内容，生成结构化的剧情概述。
+            new_segments = []
+            for seg in plan:
+                if seg.kind == "detail":
+                    # 锁定章节：有缓存就复用，锁定语义才真正成立
+                    if (seg.start_chapter == seg.end_chapter
+                            and seg.start_chapter in locked
+                            and seg.start_chapter in single_cache):
+                        new_segments.append(PlotSegment(
+                            start_chapter=seg.start_chapter,
+                            end_chapter=seg.end_chapter,
+                            summary=single_cache[seg.start_chapter],
+                        ))
+                        continue
+                    seg_text = "\n\n".join(_chapter_text(n) for n in seg.chapters)
+                    response = await api_client.chat(
+                        build_plot_detail_prompt(
+                            seg_text, seg.chapters, old_overview, gran["detail_chapter_chars"]
+                        )
+                    )
+                    per_chapter = split_detail_response(response, seg.chapters)
+                    if per_chapter:
+                        for n in seg.chapters:
+                            if n in per_chapter:
+                                new_segments.append(PlotSegment(
+                                    start_chapter=n, end_chapter=n, summary=per_chapter[n]))
+                        missing = [n for n in seg.chapters if n not in per_chapter]
+                        if missing:
+                            logger.warning(f"剧情概述：第{missing}章缺少逐章摘要，本批整段保存")
+                            new_segments.append(PlotSegment(
+                                start_chapter=seg.start_chapter,
+                                end_chapter=seg.end_chapter,
+                                summary=_strip_ai_preamble(response)))
+                    else:
+                        logger.warning(
+                            f"剧情概述：第{seg.start_chapter}-{seg.end_chapter}章"
+                            "未能拆出逐章摘要，本批整段保存"
+                        )
+                        new_segments.append(PlotSegment(
+                            start_chapter=seg.start_chapter,
+                            end_chapter=seg.end_chapter,
+                            summary=_strip_ai_preamble(response)))
+                    continue
 
-# 当前剧情概述
-{old_overview}
-
-# 章节内容（共{total_chapters}章）
-{all_text_full}
-
-# 分层压缩规则（严格遵守）
-- ≤20章：每5章左右总结为一段
-- 21-50章：每8章左右总结为一段
-
-# 输出格式
-
-### 第X-Y章：[阶段主题标题]
-[密集叙事体概述，保留所有关键细节：人名、具体行为、数值、技能名称、人物状态变化。连贯叙事，非逐章摘要。]
-
-# 重要要求
-- 直接输出概述正文，第一个字就是"###"
-- 不要输出前导说明、问候语、解释性文字
-- 每段之间空一行分隔"""
-
-                plot_response = await api_client.chat(plot_prompt)
-                project.core_prompt.plot_overview = _strip_ai_preamble(plot_response)
-                # ≤50章不缓存分段，直接用全文结果
-
-            else:
-                # >50章：增量缓存 + 分段处理
-                recent_count = 20
-                recent_chapters = chapters[-recent_count:]
-                early_chapters = chapters[:-recent_count]
-
-                # 确定压缩参数
-                if total_chapters <= 100:
-                    early_batch_size = 12
-                    early_granularity = "每12章左右总结为一段"
+                # compress / one_liner：同范围缓存优先，其次用单章摘要做素材，最后回退全文
+                cached = range_cache.get((seg.start_chapter, seg.end_chapter))
+                if cached:
+                    new_segments.append(PlotSegment(
+                        start_chapter=seg.start_chapter,
+                        end_chapter=seg.end_chapter,
+                        summary=cached))
+                    continue
+                if all(n in single_cache for n in seg.chapters):
+                    source = "\n\n".join(f"第{n}章：{single_cache[n]}" for n in seg.chapters)
                 else:
-                    early_batch_size = 20
-                    early_granularity = "每20章左右总结为一段"
+                    source = "\n\n".join(_chapter_text(n) for n in seg.chapters)
+                label = f"第{seg.start_chapter}-{seg.end_chapter}章"
+                if seg.kind == "one_liner":
+                    prompt = build_plot_one_liner_prompt(label, source, old_overview)
+                else:
+                    prompt = build_plot_compress_prompt(label, source, old_overview)
+                response = await api_client.chat(prompt)
+                new_segments.append(PlotSegment(
+                    start_chapter=seg.start_chapter,
+                    end_chapter=seg.end_chapter,
+                    summary=_strip_ai_preamble(response)))
 
-                # === 第一步：处理早期章节 ===
-                # 找出早期中未被缓存覆盖的新章节
-                early_new = [ch for ch in early_chapters if ch.chapter_number > cached_end]
-                # 找出仍有效的旧缓存：起点落在早期范围内的段（含跨越边界的段）都归早期，
-                # 保证所有缓存段都被重新处理，不会出现覆盖缺口
-                early_boundary = early_chapters[-1].chapter_number
-                early_cached = [
-                    s for s in cached_segments
-                    if s.start_chapter <= early_boundary
-                ]
-
-                early_segments = []
-                if early_cached:
-                    # 对旧缓存进行二次压缩
-                    recompressed = await _recompress_old_segments(
-                        early_cached, early_batch_size, early_granularity
-                    )
-                    early_segments.extend(recompressed)
-
-                if early_new:
-                    # 对新章节全文总结
-                    new_summaries = await _summarize_new_chapters(
-                        early_new, early_batch_size, early_granularity
-                    )
-                    early_segments.extend(new_summaries)
-
-                # === 第二步：处理近期章节（最近20章，每5章一批，全文传入）===
-                # 近期章节始终重新总结（因为颗粒度更细）
-                recent_new = [ch for ch in recent_chapters if ch.chapter_number > cached_end]
-                recent_old_cached = [
-                    s for s in cached_segments
-                    if s.start_chapter > early_boundary
-                ]
-
-                recent_segments = []
-                if recent_old_cached:
-                    # 对近期旧缓存二次压缩（5章粒度）
-                    recompressed = await _recompress_old_segments(
-                        recent_old_cached, 5, "每5章左右总结为一段"
-                    )
-                    recent_segments.extend(recompressed)
-
-                if recent_new:
-                    new_summaries = await _summarize_new_chapters(
-                        recent_new, 5, "每5章左右总结为一段"
-                    )
-                    recent_segments.extend(new_summaries)
-
-                # === 第三步：合并 ===
-                all_new_segments = early_segments + recent_segments
-                all_new_segments.sort(key=lambda s: s.start_chapter)
-
-                project.core_prompt.plot_segments = all_new_segments
-                project.core_prompt.plot_overview = "\n\n".join(
-                    s.summary for s in all_new_segments
-                )
+            new_segments.sort(key=lambda s: (s.start_chapter, s.end_chapter))
+            project.core_prompt.plot_segments = new_segments
+            project.core_prompt.plot_overview = "\n\n".join(s.summary for s in new_segments)
+            logger.info(f"剧情概述已更新：{len(new_segments)} 个分段，{len(numbers)} 章")
 
         except HTTPException:
             raise

@@ -37,6 +37,7 @@ class WriteRequest(BaseModel):
 
 class ReviseRequest(BaseModel):
     revision意见: str
+    style_sample: str = ""  # 可选：不传则自动挂载项目里的第一个文风样本
 
 
 class FinalizeRequest(BaseModel):
@@ -321,8 +322,9 @@ async def revise_chapter(novel_id: str, chapter_number: int, req: ReviseRequest)
         if chapter_plan:
             break
 
-    from app.core.writer import revise_chapter as do_revise
-    revised = await do_revise(project, chapter, req.revision意见, chapter_plan)
+    from app.core.writer import revise_chapter as do_revise, load_style_sample
+    style_sample = req.style_sample or load_style_sample(novel_id)
+    revised = await do_revise(project, chapter, req.revision意见, chapter_plan, style_sample)
 
     return {
         "message": "章节重写成功",
@@ -438,11 +440,12 @@ async def revise_chapter_stream(novel_id: str, chapter_number: int, req: ReviseR
         if chapter_plan:
             break
 
-    from app.core.writer import revise_chapter_stream as do_revise_stream
+    from app.core.writer import revise_chapter_stream as do_revise_stream, load_style_sample
+    style_sample = req.style_sample or load_style_sample(novel_id)
 
     async def event_generator():
         try:
-            async for event in do_revise_stream(project, chapter, req.revision意见, chapter_plan):
+            async for event in do_revise_stream(project, chapter, req.revision意见, chapter_plan, style_sample):
                 yield f"data: {json_module.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
             # 流中途异常必须显式告知前端（否则前端会把断连当作正常结束）

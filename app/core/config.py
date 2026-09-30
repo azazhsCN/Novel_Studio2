@@ -67,3 +67,26 @@ def get_novel_subdirs(novel_id: str) -> dict:
     for d in subdirs.values():
         d.mkdir(parents=True, exist_ok=True)
     return subdirs
+
+
+def get_plot_granularity() -> dict:
+    """剧情概述颗粒度配置（需求 3.2）；缺项或非法值一律回退默认值"""
+    cfg = load_config() or {}
+    raw = (cfg.get("novel") or {}).get("plot_granularity") or {}
+
+    def _int(key: str, default: int, lo: int, hi: int) -> int:
+        try:
+            value = int(raw.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return min(max(value, lo), hi)
+
+    detail_max = _int("detail_max_chapters", 50, 1, 100000)
+    return {
+        "detail_max_chapters": detail_max,
+        "mid_max_chapters": _int("mid_max_chapters", 150, detail_max, 100000),
+        "recent_detail_count": _int("recent_detail_count", 20, 1, 1000),
+        "detail_batch_size": _int("detail_batch_size", 5, 1, 50),
+        "detail_chapter_chars": _int("detail_chapter_chars", 300, 50, 5000),
+        "compress_block_chapters": _int("compress_block_chapters", 60, 1, 500),
+    }

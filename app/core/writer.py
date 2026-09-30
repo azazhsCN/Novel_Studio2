@@ -41,9 +41,14 @@ async def write_chapter(project: NovelProject, chapter_plan: dict,
 
 
 async def revise_chapter(project: NovelProject, chapter: Chapter,
-                         revision意见: str, chapter_plan: dict) -> Chapter:
+                         revision意见: str, chapter_plan: dict,
+                         style_sample: str = "") -> Chapter:
     """根据修改意见重写章节"""
-    prompt = build_revision_prompt(project, chapter.content, revision意见, chapter_plan)
+    tracker = ResourceTracker.load(project.id)
+    resource_summary = tracker.get_summary_for_prompt()
+    prompt = build_revision_prompt(
+        project, chapter.content, revision意见, chapter_plan, style_sample, resource_summary
+    )
     response = await api_client.chat(prompt)
 
     chapter.content = response.strip()
@@ -115,9 +120,14 @@ async def write_chapter_stream(project: NovelProject, chapter_plan: dict,
 
 
 async def revise_chapter_stream(project: NovelProject, chapter: Chapter,
-                                 revision意见: str, chapter_plan: dict):
+                                 revision意见: str, chapter_plan: dict,
+                                 style_sample: str = ""):
     """流式修改章节，yield每个token事件"""
-    prompt = build_revision_prompt(project, chapter.content, revision意见, chapter_plan)
+    tracker = ResourceTracker.load(project.id)
+    resource_summary = tracker.get_summary_for_prompt()
+    prompt = build_revision_prompt(
+        project, chapter.content, revision意见, chapter_plan, style_sample, resource_summary
+    )
 
     full_content = []
     async for token in api_client.chat_stream(prompt):
