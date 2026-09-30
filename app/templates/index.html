@@ -1028,10 +1028,9 @@ async function loadWritingWorkspace() {
             </div>
         `;
 
-        // Restore selection if any
+        // 重新渲染后恢复之前选中的章节：否则工作台退回空状态，看着像"按钮不生效"
         if (writingSelectedPlan) {
-            const wp = document.getElementById(`wp-${writingSelectedPlan}`);
-            if (wp) wp.style.background = 'var(--accent2)';
+            selectWritingPlan(writingSelectedPlan);
         }
     } catch (e) { el.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message)}</div>`; }
 }
@@ -1173,7 +1172,7 @@ async function doWriteInWorkspace() {
 }
 
 async function doReviseInWorkspace() {
-    if (!writingSelectedPlan) return;
+    if (!writingSelectedPlan) { toast('请先选择章节：已写章节可从"已写章节"页点「修改」进入', 'error'); return; }
     const opinion = document.getElementById('writingReviseInput').value;
     if (!opinion.trim()) { toast('请输入修改意见', 'error'); return; }
     if (writingIsStreaming) { toast('正在生成中，请等待', 'error'); return; }
@@ -1262,7 +1261,7 @@ document.addEventListener('keydown', function(e) {
 
 // AI targeted adjustment
 async function doAIAdjustInWorkspace() {
-    if (!writingSelectedPlan) return;
+    if (!writingSelectedPlan) { toast('请先选择章节：已写章节可从"已写章节"页点「修改」进入', 'error'); return; }
     const opinion = document.getElementById('writingReviseInput').value;
     if (!opinion.trim()) { toast('请输入调整要求（如：加强心理描写、修改对话风格等）', 'error'); return; }
     if (writingIsStreaming) { toast('正在生成中，请等待', 'error'); return; }

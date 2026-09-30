@@ -1,11 +1,14 @@
 """章节规划与写作API路由"""
 import json as json_module
+import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 from app.models.novel import NovelProject
 from app.models.chapter import ChapterBatchPlan, ChapterPlanItem, Chapter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/novels/{novel_id}/chapters", tags=["chapters"])
 
@@ -42,6 +45,40 @@ class ReviseRequest(BaseModel):
 
 class FinalizeRequest(BaseModel):
     finalized: bool = True
+
+
+def _find_chapter_plan(novel_id: str, chapter_number: int) -> Optional[dict]:
+    """在所有规划里查找指定章节的规划（找不到返回 None）"""
+    for plan in ChapterBatchPlan.list_for_novel(novel_id):
+        for ch in plan.chapters:
+            if ch.chapter_number == chapter_number:
+                return ch.model_dump()
+    return None
+
+
+def _fallback_plan_from_existing(novel_id: str, chapter_number: int, project: NovelProject) -> Optional[dict]:
+    """导入型章节没有规划时，用本章自身信息兜底，让「重新生成」可用
+
+    返回 None 表示该章既没有规划也没有已写正文——此时仍报 400，提示用户先生成规划。
+    """
+    existing = Chapter.load(novel_id, chapter_number)
+    if not existing:
+        return None
+    chapter_type = existing.chapter_type or "normal"
+    logger.info(
+        f"第{chapter_number}章没有对应规划，改用本章信息兜底生成（类型={chapter_type}，"
+        f"目标{project.get_word_count(chapter_type)}字）"
+    )
+    return {
+        "chapter_number": existing.chapter_number,
+        "title": existing.title,
+        "chapter_type": chapter_type,
+        "word_count_target": project.get_word_count(chapter_type),
+        "time": "",
+        "scene": "",
+        "core_plot": [],
+        "prompt": "",
+    }
 
 
 # ========== 章节规划 ==========
@@ -241,16 +278,11 @@ async def write_chapter(novel_id: str, req: WriteRequest):
         raise HTTPException(404, "项目不存在")
 
     # 查找对应的规划
-    plans = ChapterBatchPlan.list_for_novel(novel_id)
-    chapter_plan = None
-    for plan in plans:
-        for ch in plan.chapters:
-            if ch.chapter_number == req.chapter_number:
-                chapter_plan = ch.model_dump()
-                break
-        if chapter_plan:
-            break
+    chapter_plan = _find_chapter_plan(novel_id, req.chapter_number)
 
+    if not chapter_plan:
+        # 导入型章节（有正文、无规划）用本章自身信息兜底，避免"重新生成"直接失败
+        chapter_plan = _fallback_plan_from_existing(novel_id, req.chapter_number, project)
     if not chapter_plan:
         raise HTTPException(400, f"第{req.chapter_number}章没有对应的规划，请先生成规划")
 
@@ -383,16 +415,10 @@ async def write_chapter_stream(novel_id: str, req: WriteRequest):
     if not project:
         raise HTTPException(404, "项目不存在")
 
-    plans = ChapterBatchPlan.list_for_novel(novel_id)
-    chapter_plan = None
-    for plan in plans:
-        for ch in plan.chapters:
-            if ch.chapter_number == req.chapter_number:
-                chapter_plan = ch.model_dump()
-                break
-        if chapter_plan:
-            break
-
+    chapter_plan = _find_chapter_plan(novel_id, req.chapter_number)
+    if not chapter_plan:
+        # 导入型章节（有正文、无规划）用本章自身信息兜底，避免"重新生成"直接失败
+        chapter_plan = _fallback_plan_from_existing(novel_id, req.chapter_number, project)
     if not chapter_plan:
         raise HTTPException(400, f"第{req.chapter_number}章没有对应的规划")
 
@@ -431,14 +457,7 @@ async def revise_chapter_stream(novel_id: str, chapter_number: int, req: ReviseR
         raise HTTPException(404, "项目不存在")
 
     plans = ChapterBatchPlan.list_for_novel(novel_id)
-    chapter_plan = {}
-    for plan in plans:
-        for ch in plan.chapters:
-            if ch.chapter_number == chapter_number:
-                chapter_plan = ch.model_dump()
-                break
-        if chapter_plan:
-            break
+    chapter_plan = _find_chapter_plan(novel_id, chapter_number) or {}
 
     from app.core.writer import revise_chapter_stream as do_revise_stream, load_style_sample
     style_sample = req.style_sample or load_style_sample(novel_id)
