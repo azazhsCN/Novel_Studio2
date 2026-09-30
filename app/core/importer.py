@@ -98,53 +98,96 @@ async def import_novel(title: str, novel_text: str, novel_id: str = None) -> Nov
     return project
 
 
-def split_chapters_regex(novel_text: str) -> list[dict]:
-    """用正则表达式拆分小说文本为章节列表，返回 [{chapter_number, title, start_position}]"""
-    # 中文数字映射
-    cn_nums = {'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10,
-               '十一':11,'十二':12,'十三':13,'十四':14,'十五':15,'十六':16,'十七':17,'十八':18,'十九':19,'二十':20,
-               '二十一':21,'二十二':22,'二十三':23,'二十四':24,'二十五':25,'二十六':26,'二十七':27,'二十八':28,'二十九':29,'三十':30,
-               '三十一':31,'三十二':32,'三十三':33,'三十四':34,'三十五':35,'三十六':36,'三十七':37,'三十八':38,'三十九':39,'四十':40,
-               '四十一':41,'四十二':42,'四十三':43,'四十四':44,'四十五':45,'四十六':46,'四十七':47,'四十八':48,'四十九':49,'五十':50}
+# 强章节标记：命中即视为标题（这些形态在正文中几乎不会出现在行首）
+# 包裹符号：书名号《》、方头括号【】、六角括号〔〕、双尖括号〖〗、方括号［］[]
+# 注意：以下三个片段都是"完整字符类"，不可再嵌进别的字符类（否则会多出一个字面 ]）
+_WRAP_OPEN = r'[《【〔〖［\[]'          # 开括号
+_WRAP_CLOSE = r'[》】〕〗］\]]'          # 闭括号
+_WRAP_NOT_CLOSE = r'[^》】〕〗］\]]'     # 非闭括号字符（手写，避免嵌套字符类）
+_CN_NUM = r'[0-9０-９零一二三四五六七八九十百千万两]{1,6}'
+_STRONG_HEADING_PATTERNS = (
+    # 【书名】（12）标题 / 《书名》(12)标题 —— 中文网文常见的"书名/卷名 + 括号编号"式分章
+    re.compile(rf'^{_WRAP_OPEN}\s*{_WRAP_NOT_CLOSE}{{1,60}}\s*{_WRAP_CLOSE}\s*[（(]\s*[0-9０-９]{{1,4}}\s*[）)]'),
+    # 【第12章】标题 —— 包裹式的"第X章"
+    re.compile(rf'^{_WRAP_OPEN}\s*第\s*{_CN_NUM}\s*[章节回幕卷集篇]'),
+    # 第X章 / 第X节 / 第X回 / 第X卷 / 第X部 / 第X集 / 第X篇
+    # （"部"排除"部分"，避免把"第一部分内容"这类行内文字当成标题）
+    re.compile(rf'^第\s*{_CN_NUM}\s*(?:[章节回幕卷集篇]|部(?!分))'),
+    # Chapter 12
+    re.compile(r'^chapter\s*[0-9]{1,4}\b', re.IGNORECASE),
+)
 
-    # 匹配 "第X章" 或 "第X节" 模式，X可以是中文数字或阿拉伯数字
-    # 也匹配纯数字开头如 "1、" "1." 以及 "Chapter X"
-    pattern = r'^(第[零一二三四五六七八九十百千万\d]+[章节回幕卷]|Chapter\s*\d+|\d+[、.．]\s*)'
+# 弱章节标记：形如 "12、标题"，容易与正文（如"４．５左右，不算特别大…"）混淆，
+# 需额外加长度与标点限制后才接受
+_WEAK_HEADING_PATTERNS = (
+    re.compile(r'^[0-9]{1,4}\s*[、.．]\s*\S'),
+)
+
+# 出现这些标点说明更像叙述句而非标题
+_SENTENCE_MARKS = ('。', '！', '？', '!', '?', '…', '，', ',', '；', ';')
+
+
+def is_chapter_heading(line: str) -> bool:
+    """判断一行是否像章节标题（带正文防误判保护）"""
+    text = line.strip()
+    if not text or len(text) > 80:
+        return False
+    if any(p.match(text) for p in _STRONG_HEADING_PATTERNS):
+        return True
+    # 弱形态：必须很短、且不含任何句读标点，避免把整句正文当成标题
+    if len(text) <= 30 and not any(mark in text for mark in _SENTENCE_MARKS):
+        return any(p.match(text) for p in _WEAK_HEADING_PATTERNS)
+    return False
+
+
+def _first_line_title(text: str, limit: int = 40) -> str:
+    """取文本的第一个非空行作为标题（用于无标记的整篇文本，或首个标记之前的前言）"""
+    for line in text.split('\n'):
+        candidate = line.strip()
+        if candidate:
+            return candidate[:limit]
+    return "（前言）"
+
+
+def split_chapters_regex(novel_text: str) -> list[dict]:
+    """用正则拆分小说文本为章节列表，返回 [{chapter_number, title, start_position}]
+
+    识别以下章节标记（任一行命中即视为标题）：
+      - 【书名】（12）标题 / 《书名》(12)标题 —— 中文网文常见的"书名/卷名 + 括号编号"式分章
+      - 第X章 / 第X节 / 第X回 / 第X卷 / 第X部 / 第X集 / 第X篇（中文、阿拉伯、全角数字均可）
+      - Chapter 12
+      - 12、标题 / 12. 标题
+
+    首个标记之前的内容（书名、作者、前言）会保留为独立一章，不再被丢弃；
+    完全没有标记时，整篇作为一章，且绝不用正文句子充当标题。
+    """
     lines = novel_text.split('\n')
 
-    chapters = []
+    headings: list[dict] = []
     pos = 0  # 跟踪当前行在原文中的位置
     for line in lines:
         stripped = line.strip()
         line_start = pos
         pos += len(line) + 1  # +1 for the \n
-
         if not stripped:
             continue
-        m = re.match(pattern, stripped, re.IGNORECASE)
-        if m:
-            matched = m.group(1)
-            title = stripped
-            ch_num = len(chapters) + 1
-            num_match = re.search(r'第([零一二三四五六七八九十百千万\d]+)[章节回幕卷]', matched)
-            if num_match:
-                num_str = num_match.group(1)
-                if num_str.isdigit():
-                    ch_num = int(num_str)
-                elif num_str in cn_nums:
-                    ch_num = cn_nums[num_str]
-            elif re.match(r'Chapter\s*(\d+)', matched, re.IGNORECASE):
-                ch_num = int(re.match(r'Chapter\s*(\d+)', matched, re.IGNORECASE).group(1))
-            elif re.match(r'(\d+)[、.．]', matched):
-                ch_num = int(re.match(r'(\d+)[、.．]', matched).group(1))
+        if is_chapter_heading(stripped):
+            headings.append({"title": stripped, "start_position": line_start})
 
-            chapters.append({"chapter_number": ch_num, "title": title, "start_position": line_start})
+    # 没有找到任何章节标记：整篇文本作为单章，标题取首行（避免出现空标题或正文句标题）
+    if not headings:
+        return [{"chapter_number": 1, "title": _first_line_title(novel_text), "start_position": 0}]
 
-    # 如果没有找到任何章节标记，将整篇文本作为单章
-    if not chapters:
-        chapters.append({"chapter_number": 1, "title": "", "start_position": 0})
+    chapters: list[dict] = []
+    if headings[0]["start_position"] > 0:
+        # 首个标题之前的内容（书名/作者/前言）单独成章，保证正文不丢
+        chapters.append({
+            "title": _first_line_title(novel_text[:headings[0]["start_position"]]),
+            "start_position": 0,
+        })
+    chapters.extend(headings)
 
-    # 修正：确保start_position是唯一的，按位置排序后重新编号
+    # 按位置排序后统一重新编号，保证章节号连续（避免原文编号跳号/重号）
     chapters.sort(key=lambda x: x["start_position"])
     for i, ch in enumerate(chapters):
         ch["chapter_number"] = i + 1
