@@ -11,8 +11,110 @@
 import re
 from dataclasses import dataclass, field
 
-# 匹配 “### 第12章：标题” / “## 第12章 xxx”
-_DETAIL_HEADING_RE = re.compile(r'^#{1,4}\s*第\s*(\d+)\s*章', re.MULTILINE)
+_HEADING_NUM = r'[0-9０-９零〇一二三四五六七八九十百千万两]+'
+_HEADING_SEP = r'[：:、.．—-]'
+# 标准写法：带 # 的 markdown 标题（提示词要求 AI 输出这种）
+_DETAIL_HEADING_RE = re.compile(
+    rf'^[ \t]{{0,3}}#{{1,6}}[ \t]*\*{{0,2}}[ \t]*第[ \t]*({_HEADING_NUM})[ \t]*章',
+    re.MULTILINE)
+# 兜底写法：不带 #，但「章」后必须紧跟分隔符或加粗符号。
+# 不能放宽到"章 + 任意字符"，否则正文里的「第1章的详细摘要…」会被当成标题（曾踩过）。
+_BARE_HEADING_RE = re.compile(
+    rf'^[ \t]{{0,3}}\*{{0,2}}[ \t]*第[ \t]*({_HEADING_NUM})[ \t]*章[ \t]*(?:{_HEADING_SEP}|\*)',
+    re.MULTILINE)
+# 用于剥掉文本开头的一行标题
+_LEADING_MD_HEADING_RE = re.compile(
+    rf'^[ \t]{{0,3}}#{{1,6}}[ \t]*\*{{0,2}}[ \t]*第[ \t]*({_HEADING_NUM})[ \t]*章[ \t]*{_HEADING_SEP}?')
+_LEADING_BARE_HEADING_RE = re.compile(
+    rf'^[ \t]{{0,3}}\*{{0,2}}[ \t]*第[ \t]*({_HEADING_NUM})[ \t]*章[ \t]*(?:{_HEADING_SEP}|\*)')
+
+_CN_DIGITS = {'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+              '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+
+
+def cn_to_int(text: str) -> int | None:
+    """把章节号转成 int：支持「12」「１２」「十二」「二十三」「一百零五」，无法解析返回 None"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    normalized = s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+    if normalized.isdigit():
+        return int(normalized)
+    if any(ch not in _CN_DIGITS and ch not in '十百千' for ch in s):
+        return None
+    total = 0
+    number = 0
+    for ch in s:
+        if ch in _CN_DIGITS:
+            number = _CN_DIGITS[ch]
+        elif ch == '十':
+            total += (number or 1) * 10
+            number = 0
+        elif ch == '百':
+            total += (number or 1) * 100
+            number = 0
+        elif ch == '千':
+            total += (number or 1) * 1000
+            number = 0
+        else:
+            return None
+    return total + number
+
+
+def _heading_spans(text: str) -> list[tuple[int, int, int]]:
+    """返回 [(标题起点, 标题终点, 章节号)]，按位置排序并去除重叠"""
+    spans: list[tuple[int, int, int]] = []
+    for match in _DETAIL_HEADING_RE.finditer(text):
+        num = cn_to_int(match.group(1))
+        if num is not None:
+            spans.append((match.start(), match.end(), num))
+    for match in _BARE_HEADING_RE.finditer(text):
+        num = cn_to_int(match.group(1))
+        if num is None:
+            continue
+        line_end = text.find('\n', match.start())
+        line = text[match.start():line_end if line_end != -1 else len(text)]
+        if '。' in line or len(line.strip()) > 40:
+            continue  # 长句/叙述句不像标题
+        spans.append((match.start(), match.end(), num))
+    spans.sort()
+    merged: list[tuple[int, int, int]] = []
+    for span in spans:
+        if merged and span[0] < merged[-1][1]:
+            continue  # 与上一个标题重叠（同一标题的两种写法）
+        merged.append(span)
+    return merged
+
+
+def strip_leading_heading(text: str) -> str:
+    """去掉开头的一行章节标题（保留标题行里分隔符之后的正文）
+
+    解析成功时标题由 `format_overview_segment` 统一补回，避免出现
+    「标题被剥掉后概述里看不到章节号」或「中文/阿拉伯数字混排」的问题。
+    """
+    s = (text or "").lstrip()
+    if not s:
+        return ""
+    match = _LEADING_MD_HEADING_RE.match(s) or _LEADING_BARE_HEADING_RE.match(s)
+    if not match:
+        return text.strip()
+    return s[match.end():].lstrip('：:、.．—-* \t').strip()
+
+
+def format_overview_segment(start_chapter: int, end_chapter: int, summary: str) -> str:
+    """给一个分段加上规范的章节号标题，保证剧情概述里始终能看到章节号"""
+    label = (f"第{start_chapter}章" if start_chapter == end_chapter
+             else f"第{start_chapter}-{end_chapter}章")
+    body = (summary or "").strip()
+    if not body:
+        return f"### {label}"
+    lines = body.split("\n")
+    first = lines[0].strip().lstrip('：:、.．—- ').strip()
+    rest = "\n".join(lines[1:]).strip()
+    # 首行很短且还有正文时，视作本章标题，放到标题行上
+    if rest and first and len(first) <= 30:
+        return f"### {label}：{first}\n\n{rest}"
+    return f"### {label}\n{body}"
 
 
 @dataclass
@@ -89,18 +191,21 @@ def build_segment_plan(chapter_numbers, locked_chapters, granularity: dict) -> l
 
 
 def split_detail_response(text: str, chapter_numbers) -> dict[int, str]:
-    """把“### 第12章：xxx”形式的响应拆成 {章节号: 该章概述}"""
+    """把「### 第12章：xxx」「## 第十二章 xxx」等响应拆成 {章节号: 该章概述}
+
+    章节号支持阿拉伯/全角/中文数字；返回的概述已去掉标题行（标题由
+    `format_overview_segment` 统一补回），并清理标题后遗留的分隔符。
+    """
     if not text:
         return {}
     wanted = {int(n) for n in chapter_numbers}
-    hits = list(_DETAIL_HEADING_RE.finditer(text))
+    spans = _heading_spans(text)
     result: dict[int, str] = {}
-    for i, match in enumerate(hits):
-        num = int(match.group(1))
+    for i, (_start, end, num) in enumerate(spans):
         if num not in wanted or num in result:
             continue
-        end = hits[i + 1].start() if i + 1 < len(hits) else len(text)
-        body = text[match.end():end].strip()
+        stop = spans[i + 1][0] if i + 1 < len(spans) else len(text)
+        body = text[end:stop].strip().lstrip('：:、.．—- \t').strip()
         if body:
             result[num] = body
     return result

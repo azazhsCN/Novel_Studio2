@@ -534,7 +534,10 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
         #   更多章：早期压缩为一句话 + 中期压缩为一段；锁定章节永远单独成段。
         from app.models.novel import PlotSegment
         from app.core.config import get_plot_granularity
-        from app.core.plot_granularity import build_segment_plan, split_detail_response, describe_plan
+        from app.core.plot_granularity import (
+            build_segment_plan, split_detail_response, describe_plan,
+            strip_leading_heading, format_overview_segment,
+        )
         from app.core.prompt_builder import (
             build_plot_detail_prompt, build_plot_compress_prompt, build_plot_one_liner_prompt,
         )
@@ -582,14 +585,15 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
                         for n in seg.chapters:
                             if n in per_chapter:
                                 new_segments.append(PlotSegment(
-                                    start_chapter=n, end_chapter=n, summary=per_chapter[n]))
+                                    start_chapter=n, end_chapter=n,
+                                    summary=strip_leading_heading(per_chapter[n])))
                         missing = [n for n in seg.chapters if n not in per_chapter]
                         if missing:
                             logger.warning(f"剧情概述：第{missing}章缺少逐章摘要，本批整段保存")
                             new_segments.append(PlotSegment(
                                 start_chapter=seg.start_chapter,
                                 end_chapter=seg.end_chapter,
-                                summary=_strip_ai_preamble(response)))
+                                summary=strip_leading_heading(_strip_ai_preamble(response))))
                     else:
                         logger.warning(
                             f"剧情概述：第{seg.start_chapter}-{seg.end_chapter}章"
@@ -598,7 +602,7 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
                         new_segments.append(PlotSegment(
                             start_chapter=seg.start_chapter,
                             end_chapter=seg.end_chapter,
-                            summary=_strip_ai_preamble(response)))
+                            summary=strip_leading_heading(_strip_ai_preamble(response))))
                     continue
 
                 # compress / one_liner：同范围缓存优先，其次用单章摘要做素材，最后回退全文
@@ -622,11 +626,16 @@ async def ai_update_core_prompt(novel_id: str, req: AIUpdateRequest):
                 new_segments.append(PlotSegment(
                     start_chapter=seg.start_chapter,
                     end_chapter=seg.end_chapter,
-                    summary=_strip_ai_preamble(response)))
+                    summary=strip_leading_heading(_strip_ai_preamble(response))))
 
             new_segments.sort(key=lambda s: (s.start_chapter, s.end_chapter))
             project.core_prompt.plot_segments = new_segments
-            project.core_prompt.plot_overview = "\n\n".join(s.summary for s in new_segments)
+            # 概述文本由分段拼装，章节号标题由 format_overview_segment 统一补，
+            # 保证「### 第N章」在任何分档下都不会丢（此前解析成功时标题被剥掉导致后段无章节号）
+            project.core_prompt.plot_overview = "\n\n".join(
+                format_overview_segment(s.start_chapter, s.end_chapter, s.summary)
+                for s in new_segments
+            )
             logger.info(f"剧情概述已更新：{len(new_segments)} 个分段，{len(numbers)} 章")
 
         except HTTPException:
