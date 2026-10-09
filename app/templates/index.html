@@ -309,20 +309,28 @@ function toast(msg, type = 'info') {
     setTimeout(() => t.remove(), 4000);
 }
 
-// 篇幅提示：生成结果明显短于目标时给出可见反馈（此前只看字数无法判断是否达标）
+// 篇幅提示：生成结果明显短于目标、或续写中断时给出可见反馈
 function lengthNotice(prefix, ev) {
     const target = ev && ev.target_words;
     const final = ev && ev.final_words;
-    if (!target || !final) return prefix + '！';
-    const pct = Math.round(final / target * 100);
-    const extra = ev.passes > 1 ? `，续写${ev.passes - 1}轮` : '';
-    if (final < target * 0.9) {
-        return `${prefix}：${final}/${target}字（${pct}%${extra}）—— 仍不足目标，可再点「重新生成」，或在修改意见里要求扩写`;
+    const warn = ev && ev.warning;
+    let text;
+    if (!target || !final) {
+        text = prefix + '！';
+    } else {
+        const pct = Math.round(final / target * 100);
+        const extra = ev.passes > 1 ? `，续写${ev.passes - 1}轮` : '';
+        if (final < target * 0.9) {
+            text = `${prefix}：${final}/${target}字（${pct}%${extra}）—— 仍不足目标，可再点「重新生成」，或在修改意见里要求扩写`;
+        } else {
+            text = `${prefix}：${final}/${target}字（${pct}%${extra}）`;
+        }
     }
-    return `${prefix}：${final}/${target}字（${pct}%${extra}）`;
+    return warn ? `${text}；${warn}` : text;
 }
 
 function lengthNoticeType(ev) {
+    if (ev && ev.warning) return 'info';
     const target = ev && ev.target_words;
     const final = ev && ev.final_words;
     return (target && final && final < target * 0.9) ? 'info' : 'success';

@@ -142,7 +142,15 @@ async def write_chapter(project: NovelProject, chapter_plan: dict,
             project, chapter_plan, content, remaining, opts["continuation_tail_chars"]
         )
         stats = {}
-        content = _merge_continuation(content, await api_client.chat(cont_prompt, stats=stats))
+        try:
+            content = _merge_continuation(content, await api_client.chat(cont_prompt, stats=stats))
+        except Exception as e:
+            # 续写失败不能连累已生成内容：保留现有正文，记录告警后停止续写
+            logger.warning(
+                f"第{chapter_plan.get('chapter_number', '?')}章续写中断，保留已生成 "
+                f"{len(content)} 字（目标 {target} 字）：{type(e).__name__}: {e}"
+            )
+            break
         finish = stats.get("finish_reason", "")
         passes += 1
 
@@ -190,7 +198,14 @@ async def revise_chapter(project: NovelProject, chapter: Chapter,
             project, chapter_plan, content, remaining, opts["continuation_tail_chars"]
         )
         stats = {}
-        content = _merge_continuation(content, await api_client.chat(cont_prompt, stats=stats))
+        try:
+            content = _merge_continuation(content, await api_client.chat(cont_prompt, stats=stats))
+        except Exception as e:
+            logger.warning(
+                f"第{chapter.chapter_number}章改稿续写中断，保留已生成 {len(content)} 字"
+                f"（目标 {target} 字）：{type(e).__name__}: {e}"
+            )
+            break
         finish = stats.get("finish_reason", "")
         passes += 1
 
@@ -248,6 +263,7 @@ async def _generate_stream(project: NovelProject, prompt: str, chapter_plan: dic
     content = "".join(full_content).strip()
     passes = 1
     finish = stats.get("finish_reason", "")
+    warning = ""
 
     while _should_continue(content, target, passes, opts, finish):
         remaining = max(target - len(content), 0)
@@ -256,9 +272,20 @@ async def _generate_stream(project: NovelProject, prompt: str, chapter_plan: dic
         )
         stats = {}
         addition: list[str] = []
-        async for piece in _stream_continuation(content, cont_prompt, stats):
-            addition.append(piece)
-            yield {"type": "token", "content": piece}
+        try:
+            async for piece in _stream_continuation(content, cont_prompt, stats):
+                addition.append(piece)
+                yield {"type": "token", "content": piece}
+        except Exception as e:
+            # 续写中断：把已经收到的续写片段并进去，保留成果并告知前端
+            if addition:
+                content = f"{content}{''.join(addition)}"
+            warning = (
+                f"续写中断（{e}），已保留 {len(content)}/{target} 字；"
+                "可稍后点「重新生成」补齐剩余篇幅"
+            )
+            logger.warning(f"{label} 续写中断，保留已生成内容：{type(e).__name__}: {e}")
+            break
         if addition:
             content = f"{content}{''.join(addition)}"
         finish = stats.get("finish_reason", "")
@@ -270,6 +297,7 @@ async def _generate_stream(project: NovelProject, prompt: str, chapter_plan: dic
         "content": content,
         "target_words": target,
         "passes": passes,
+        "warning": warning,
     }
 
 
@@ -312,6 +340,7 @@ async def write_chapter_stream(project: NovelProject, chapter_plan: dict,
         "target_words": final["target_words"],
         "final_words": len(final["content"]),
         "passes": final["passes"],
+        "warning": final.get("warning", ""),
     }
 
 
@@ -348,4 +377,5 @@ async def revise_chapter_stream(project: NovelProject, chapter: Chapter,
         "target_words": final["target_words"],
         "final_words": len(final["content"]),
         "passes": final["passes"],
+        "warning": final.get("warning", ""),
     }
