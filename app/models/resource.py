@@ -10,12 +10,13 @@ from app.core.storage import backup_file, quarantine_corrupt_file
 
 logger = logging.getLogger(__name__)
 
-# 首选的资源分类（键 → 中文名）。历史数据里出现过模型外分类（如 skill、system_character），
-# 一律保留并展示，不做静默丢弃；顺序即前端展示顺序。
+# 资源分类（键 → 中文名）。这 5 类是通用容器，任何题材都能落到其中一类：
+# 没有"数值体系"的作品（写实、言情、文学等）system 分类自然为空即可。
+# 历史数据里出现过模型自造分类（如 skill、system_character），一律保留并展示，不做静默丢弃。
 RESOURCE_CATEGORIES = {
     "wealth": "财富/资产",
     "item": "重要物品",
-    "system": "系统/数值",
+    "system": "体系/数值",
     "character_status": "人物状态",
     "foreshadow": "伏笔/悬念",
 }
@@ -49,28 +50,44 @@ IMPORTANCE_LABELS = {
 # 资源条目状态：tracked=已入库，candidate=待确认（不进入提示词），ignored=已忽略
 ITEM_STATES = {"tracked", "candidate", "ignored"}
 
-# 归一化名称时要去掉的装饰性后缀/括注，例如「柳冰冰（状态）」「技能（C级）」
+# 归一化名称时要去掉的装饰性成分：
+# 1) 括注，如「角色名（状态）」「技能（C级）」
 _DECOR_RE = re.compile(r"[（(][^）)]{0,12}[）)]")
+# 2) 包裹符号，如「「道具名」」「《书名》」「"名字"」「【名】」
+_WRAP_RE = re.compile(r"[「」『』《》〈〉【】\[\]“”\"'`]")
+# 3) 无括注的状态类后缀，如「角色名心理状态」「角色名身体状态」「角色名（已改为：角色名状态」。
+#    只剥离"状态/现状/近况/情况/资料/信息"这类纯元信息后缀——不能剥离
+#    "好友/师兄/妻子"等实义称谓，否则会把不同实体合并。
+_STATUS_SUFFIX_RE = re.compile(
+    r"(?:的)?(?:心理|身体|生理|精神|身份|情感|当前|最新)?(?:状态|现状|近况|情况|资料|信息|更新)$"
+)
 _PUNCT_RE = re.compile(r"[\s\u3000·・,，。.、;；:：!！?？\"'“”‘’`~\-_/\\|+*#]")
 
 
 # 只有这些"纯状态词"才算没有信息量；不能按长度粗暴判断，
-# 否则「在手上」「Lv3」这类合法短值会被误杀。
+# 否则「在手上」「三成」「68」这类合法短值会被误杀。
 # 注意：必须定义在模块级——pydantic 会把类中以 "_" 开头的属性当作私有属性处理。
 _STATUS_ONLY_VALUES = {
     "已获得", "已兑换", "已解锁", "已销毁", "已回收", "已触发",
-    "已更新", "已变更", "无", "未知", "暂无",
+    "已更新", "已变更", "已失去", "已使用", "已拿到", "已拾取",
+    "无", "未知", "暂无", "待定",
 }
 
 
 def normalize_resource_name(name: str) -> str:
     """归一化资源名，用于近似重复判定
 
-    「柳冰冰（状态）」「柳冰冰心理状态」「柳冰冰 状态」归一化后都能对齐到「柳冰冰心理状态」
-    这一类装饰差异上——但不会把「初级格斗术」和「高级格斗术」判成同一个（保持原文差异）。
+    会剥离三类"纯元信息装饰"，使「角色名（状态）」「角色名心理状态」
+    「「角色名」」都对齐到「角色名」；但**不会**碰实义差异——
+    「初级格斗术」与「高级格斗术」、「青锋剑」与「青锋剑谱」仍保持不同。
     """
-    text = _DECOR_RE.sub("", name or "")
+    text = _WRAP_RE.sub("", name or "")
+    text = _DECOR_RE.sub("", text)
     text = _PUNCT_RE.sub("", text)
+    # 后缀剥离后若过短说明剥多了（如原名本身就叫"状态"），回退
+    stripped = _STATUS_SUFFIX_RE.sub("", text)
+    if len(stripped) >= 2:
+        text = stripped
     return text.lower()
 
 
@@ -152,8 +169,8 @@ class ResourceTracker(BaseModel):
         """在同分类里找"同一条资源"的既有条目，返回索引（P1 归并）
 
         判定要保守：只认归一化后完全相等，或相似度够高**且长度相当**。
-        仅按子串匹配会把「柳冰冰」和「柳冰冰的纹身」误并成一条（实测会把 9 条
-        不同资源压成一组），因此子串只在长度接近时才采纳。
+        仅按子串匹配会把「角色名」和「角色名的纹身」误并成一条，因此子串只在
+        长度接近时才采纳。
         """
         target = normalize_resource_name(name)
         if not target:
@@ -182,7 +199,7 @@ class ResourceTracker(BaseModel):
         """写入资源，返回动作：added / merged / rejected
 
         相比此前"只做 (category, name) 精确匹配"，现在增加了：
-        - 近似重名归并（保留别名，避免「柳冰冰（状态）」和「柳冰冰心理状态」并存）
+        - 近似重名归并（保留别名，避免「角色名（状态）」和「角色名心理状态」并存）
         - 低信息量拒收（值为空或仅"已获得"这类无内容描述）
         - 候选区（state=candidate 不进入提示词，等待人工确认）
         """
@@ -383,7 +400,7 @@ class ResourceTracker(BaseModel):
         """列出近似重名分组，供"资源表体检"与一键合并使用
 
         与 find_similar 同样的保守规则：归一化完全相等，或"相似度够高且长度相当"。
-        不做子串包含匹配，否则「柳冰冰」会把所有带她名字的条目都吞进去。
+        不做子串包含匹配，否则「角色名」会把所有带该角色名的条目都吞进去。
         """
         names = [(i, r) for i, r in enumerate(self.resources) if r.state != "ignored"]
         groups: list[list[int]] = []

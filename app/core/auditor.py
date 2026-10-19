@@ -275,19 +275,30 @@ async def audit_chapter(project: NovelProject, chapter: Chapter) -> dict:
 
 
 def _coerce_category(category: str, name: str) -> str:
-    """把模型自造分类映射到现有 5 类（历史数据里的 skill / system_character 等）"""
+    """把模型自造分类映射到现有 5 类（历史数据里的 skill / system_character 等）
+
+    只做"归类兜底"，不依赖具体题材：任何无法识别的分类最终落到 item，
+    因为在没有数值体系的作品里，多记一个物件比丢失信息更安全。
+    """
     c = (category or "").lower()
     if c in RESOURCE_CATEGORIES:
         return c
-    if any(k in c for k in ("skill", "ability", "技能")):
+    # 数值/能力/技能类 → 体系数值
+    if any(k in c for k in ("skill", "ability", "技能", "能力", "属性", "等级", "level", "stat")):
         return "system"
-    if any(k in c for k in ("character", "人物", "角色")):
+    # 人物/角色类 → 人物状态
+    if any(k in c for k in ("character", "人物", "角色", "relation", "关系")):
         return "character_status"
-    if any(k in c for k in ("item", "prop", "物品", "道具")):
+    # 物品/道具类
+    if any(k in c for k in ("item", "prop", "物品", "道具", "物件")):
         return "item"
-    if any(k in c for k in ("money", "wealth", "资产", "钱")):
+    # 资产/财富类
+    if any(k in c for k in ("money", "wealth", "资产", "钱", "财富", "finance")):
         return "wealth"
-    if "伏笔" in name or "foreshadow" in c:
+    # 伏笔/线索类
+    if any(k in c for k in ("foreshadow", "clue", "伏笔", "悬念", "线索")):
+        return "foreshadow"
+    if "伏笔" in (name or ""):
         return "foreshadow"
     return "item"
 
