@@ -10,7 +10,7 @@ from pathlib import Path
 from app.api import novels, chapters, audit
 
 # 版本号单一来源：前端侧边栏、FastAPI 元数据与 /api/health 三处保持一致
-APP_VERSION = "26.9.30"
+APP_VERSION = "26.10.19"
 
 # 配置日志
 logging.basicConfig(
