@@ -891,17 +891,55 @@ async function savePrompt() {
 }
 
 // ========== Audit ==========
+const SEVERITY_META = {
+    error:   { label: '错误', color: 'var(--danger)',  hint: '须修正，会让本章审计不通过' },
+    warning: { label: '警告', color: 'var(--warning)', hint: '建议确认，不阻塞定稿' },
+    info:    { label: '提示', color: 'var(--text2)',   hint: '写作建议，可忽略' },
+};
+
+function severityBadge(sev) {
+    const meta = SEVERITY_META[sev] || SEVERITY_META.warning;
+    return `<span class="badge" style="background:${meta.color};color:#fff;" title="${meta.hint}">${meta.label}</span>`;
+}
+
 async function loadAuditPanel() {
     const el = document.getElementById('auditPanel');
     try {
         const data = await api(`/api/novels/${currentNovelId}/audit/report`);
+        const sevCounts = data.severity_counts || {};
         let html = `
             <div class="stats">
                 <div class="stat-card"><div class="stat-value">${data.total_resources}</div><div class="stat-label">追踪资源数</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:var(--danger)">${sevCounts.error || 0}</div><div class="stat-label">待修错误</div></div>
+                <div class="stat-card"><div class="stat-value" style="color:var(--warning)">${sevCounts.warning || 0}</div><div class="stat-label">待确认警告</div></div>
                 <div class="stat-card"><div class="stat-value">${data.total_conflicts}</div><div class="stat-label">总冲突数</div></div>
                 <div class="stat-card"><div class="stat-value">${data.resolved_conflicts}</div><div class="stat-label">已解决冲突</div></div>
             </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <button class="btn btn-sm btn-secondary" data-action="showResourceHealth">资源表体检</button>
+                <button class="btn btn-sm btn-warning" data-action="bulkCleanupResources">一键整理资源表</button>
+            </div>
         `;
+
+        // 候选区：低置信度/次要条目，需人工确认后才进入提示词
+        const candidates = data.candidates || [];
+        if (candidates.length) {
+            html += `<div class="card"><div class="card-header" style="color:var(--info)">待确认资源（${candidates.length} 条，暂不进入提示词）</div><div class="card-body">
+                <table class="table"><tr><th>分类</th><th>名称</th><th>值</th><th>重要度</th><th>操作</th></tr>`;
+            for (const c of candidates) {
+                html += `<tr>
+                    <td style="font-size:12px;">${escapeHtml(c.category)}</td>
+                    <td>${escapeHtml(c.name)}</td>
+                    <td style="font-size:12px;color:var(--text2);">${escapeHtml((c.value || '').substring(0, 60))}</td>
+                    <td style="font-size:12px;">${escapeHtml(c.importance || 'normal')}</td>
+                    <td>
+                        <button class="btn btn-sm btn-success" data-action="handleCandidate" data-index="${c.index}" data-op="accept">采纳</button>
+                        <button class="btn btn-sm btn-secondary" data-action="handleCandidate" data-index="${c.index}" data-op="ignore">忽略</button>
+                    </td>
+                </tr>`;
+            }
+            html += `</table></div></div>`;
+        }
 
         // Resources (editable tables)：按后端返回的分类渲染，
         // 模型外分类（历史数据里的 skill / system_character 等）同样展示，避免静默丢失
@@ -942,22 +980,35 @@ async function loadAuditPanel() {
             html += '</div></div>';
         }
 
-        // Unresolved conflicts (markdown rendering)
+        // 未解决冲突：按严重度分组展示，错误优先
         const conflicts = data.unresolved_conflicts || [];
-        if (conflicts.length) {
-            html += `<div class="card"><div class="card-header" style="color:var(--warning)">未解决冲突</div><div class="card-body">`;
-            for (let i = 0; i < conflicts.length; i++) {
-                const c = conflicts[i];
-                const idx = c.actual_index !== undefined ? c.actual_index : i;
-                let md = `**第${c.chapter_number}章** [${escapeHtml(c.conflict_type)}]\n\n`;
-                md += `${escapeHtml(c.description)}\n\n`;
-                md += `> 建议：${escapeHtml(c.suggestion)}\n`;
+        const severityLabels = { error: '错误（须修正）', warning: '警告（建议确认）', info: '提示（写作建议）' };
+        const bySeverity = { error: [], warning: [], info: [] };
+        for (const c of conflicts) {
+            (bySeverity[c.severity] || bySeverity.warning).push(c);
+        }
+        for (const sev of ['error', 'warning', 'info']) {
+            const list = bySeverity[sev];
+            if (!list.length) continue;
+            const meta = SEVERITY_META[sev] || SEVERITY_META.warning;
+            const collapsed = sev === 'info';
+            html += `<div class="card"><div class="card-header" style="color:${meta.color}">${severityLabels[sev]}（${list.length} 条）</div><div class="card-body">`;
+            for (const c of list) {
+                const idx = c.actual_index !== undefined ? c.actual_index : 0;
+                const typeLabel = c.conflict_type_label || c.conflict_type;
+                let md = `**第${c.chapter_number}章** [${escapeHtml(typeLabel)}]\n\n`;
+                md += `${escapeHtml(c.description)}\n`;
+                if (c.anchor) md += `\n> 待改原句：${escapeHtml(c.anchor)}\n`;
+                if (c.suggestion) md += `\n> 建议：${escapeHtml(c.suggestion)}\n`;
+                if (c.notes) md += `\n<small style="color:var(--text2)">${escapeHtml(c.notes)}</small>\n`;
+                const canPatch = c.fix_type && c.fix_type !== 'none' && c.fix_type !== 'update_resource';
                 html += `<div class="conflict-item">
                     <div class="markdown-body">${renderMarkdown(md)}</div>
                     <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">
+                        <button class="btn btn-sm btn-primary" data-action="proposePatch" data-index="${idx}" ${canPatch ? '' : 'disabled title="该条冲突未给出可定位的改写"'}>生成补丁</button>
                         <button class="btn btn-sm btn-secondary" title="标记为误报" data-action="resolveConflict" data-index="${idx}" data-resolution="ignore">忽略</button>
                         <button class="btn btn-sm btn-warning" title="我已在上方资源表中手动修正，标记为已处理" data-action="resolveConflict" data-index="${idx}" data-resolution="update_resource">更新资源表</button>
-                        <button class="btn btn-sm btn-info" title="跳到写作工作台修改本章，并标记该冲突为已处理" data-action="modifyChapterForConflict" data-index="${idx}" data-chapter="${c.chapter_number}">修改章节</button>
+                        <button class="btn btn-sm btn-info" title="整个章节重写（成本高，仅当多处冲突时使用）" data-action="modifyChapterForConflict" data-index="${idx}" data-chapter="${c.chapter_number}">整章重写</button>
                     </div>
                 </div>`;
             }
@@ -1766,10 +1817,142 @@ async function resolveConflict(index, resolution) {
     } catch (e) { toast(e.message, 'error'); }
 }
 
-// 处置三选项之"修改章节"：标记冲突已处理，并跳到写作工作台改稿
+// 处置三选项之"修改章节"：改用段落补丁；此处仍保留整章重写作为兜底
 async function modifyChapterForConflict(index, chapterNumber) {
+    if (!confirm('整章重写会重新生成全部内容（成本较高），仅建议在冲突较多时使用。\n\n是否继续？')) return;
     await resolveConflict(index, 'modify_chapter');
     switchToWritingForChapter(chapterNumber);
+}
+
+// ========== 段落级补丁（审计建议落地）==========
+let _pendingPatch = null;
+
+async function proposePatch(conflictIndex) {
+    showLoading('正在生成局部补丁...', '只改有问题的段落，其余文字保持不动');
+    try {
+        const data = await api(`/api/novels/${currentNovelId}/audit/patch/propose`, {
+            method: 'POST',
+            body: JSON.stringify({ conflict_index: conflictIndex }),
+        });
+        _pendingPatch = { conflictIndex, data };
+        renderPatchModal(data);
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally { hideLoading(); }
+}
+
+function renderPatchModal(data) {
+    const patches = data.patches || [];
+    let html = `<div style="font-size:13px;color:var(--text2);margin-bottom:12px;">
+        第${data.chapter_number}章 · 共 ${data.paragraph_count} 段 · 将修改 ${patches.length} 段
+    </div>`;
+    for (let i = 0; i < patches.length; i++) {
+        const p = patches[i];
+        html += `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px;">
+            <div style="font-size:12px;color:var(--text2);margin-bottom:6px;">第 ${p.paragraph_index + 1} 段</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                <div>
+                    <div style="font-size:11px;color:var(--danger);margin-bottom:4px;">原文</div>
+                    <div style="background:var(--bg2);padding:8px;border-radius:6px;font-size:13px;line-height:1.7;max-height:200px;overflow:auto;">${escapeHtml(p.original)}</div>
+                </div>
+                <div>
+                    <div style="font-size:11px;color:var(--success);margin-bottom:4px;">修改后</div>
+                    <div style="background:var(--bg2);padding:8px;border-radius:6px;font-size:13px;line-height:1.7;max-height:200px;overflow:auto;">${escapeHtml(p.revised)}</div>
+                </div>
+            </div>
+        </div>`;
+    }
+    const delta = patches.reduce((sum, p) => sum + (p.revised.length - p.original.length), 0);
+    html += `<div style="font-size:12px;color:var(--text2);">字数变化：${delta >= 0 ? '+' : ''}${delta} 字</div>`;
+
+    showModal('应用局部补丁', html,
+        `<button class="btn btn-primary" data-action="applyPatch">应用修改</button>
+         <button class="btn btn-secondary" data-action="closeModal">取消</button>`);
+}
+
+async function applyPendingPatch() {
+    if (!_pendingPatch) return;
+    const { conflictIndex, data } = _pendingPatch;
+    try {
+        const result = await api(`/api/novels/${currentNovelId}/audit/patch/apply`, {
+            method: 'POST',
+            body: JSON.stringify({
+                conflict_index: conflictIndex,
+                patches: data.patches.map(p => ({
+                    paragraph_index: p.paragraph_index,
+                    original: p.original,
+                    revised: p.revised,
+                })),
+            }),
+        });
+        _pendingPatch = null;
+        closeModal();
+        toast(`已应用 ${result.applied.length} 处修改（${result.before_chars} → ${result.after_chars} 字）`, 'success');
+        await loadAuditPanel();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+// ========== 资源表体检与整理 ==========
+async function showResourceHealth() {
+    showLoading('正在体检资源表...');
+    try {
+        const h = await api(`/api/novels/${currentNovelId}/audit/resources/health`);
+        let html = `<div class="stats" style="margin-bottom:12px;">
+            <div class="stat-card"><div class="stat-value">${h.total}</div><div class="stat-label">总条目</div></div>
+            <div class="stat-card"><div class="stat-value">${h.tracked}</div><div class="stat-label">已入库</div></div>
+            <div class="stat-card"><div class="stat-value" style="color:var(--warning)">${h.duplicate_groups.length}</div><div class="stat-label">重名组</div></div>
+            <div class="stat-card"><div class="stat-value" style="color:var(--danger)">${h.low_information.length}</div><div class="stat-label">低信息量</div></div>
+            <div class="stat-card"><div class="stat-value">${h.stale.length}</div><div class="stat-label">久未跟进</div></div>
+        </div>`;
+
+        if (h.duplicate_groups.length) {
+            html += `<div style="font-weight:600;margin:12px 0 6px;">近似重名（可合并）</div>`;
+            for (const g of h.duplicate_groups) {
+                html += `<div style="border-left:3px solid var(--warning);padding:6px 10px;margin-bottom:8px;font-size:13px;">
+                    ${g.names.map(n => escapeHtml(n)).join(' <span style="color:var(--text2)">≈</span> ')}
+                </div>`;
+            }
+        }
+        if (h.low_information.length) {
+            html += `<div style="font-weight:600;margin:12px 0 6px;">低信息量条目（建议忽略）</div>`;
+            for (const it of h.low_information.slice(0, 20)) {
+                html += `<div style="font-size:13px;color:var(--text2);">· [${escapeHtml(it.category)}] ${escapeHtml(it.name)}</div>`;
+            }
+            if (h.low_information.length > 20) html += `<div style="font-size:12px;color:var(--text2);">…共 ${h.low_information.length} 条</div>`;
+        }
+        if (!h.duplicate_groups.length && !h.low_information.length) {
+            html += `<div style="color:var(--success);margin-top:12px;">资源表很干净，没有发现问题。</div>`;
+        }
+
+        showModal('资源表体检', html,
+            `<button class="btn btn-warning" data-action="bulkCleanupResources">一键合并重名</button>
+             <button class="btn btn-secondary" data-action="closeModal">关闭</button>`);
+    } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
+}
+
+async function bulkCleanupResources() {
+    if (!confirm('将自动合并识别出的重名条目（保留信息最全的一条，其余并入别名）。\n\n是否继续？')) return;
+    try {
+        const r = await api(`/api/novels/${currentNovelId}/audit/resources/cleanup`, {
+            method: 'POST',
+            body: JSON.stringify({ merge_duplicates: true }),
+        });
+        closeModal();
+        toast(`整理完成：${r.before} → ${r.after} 条，合并 ${r.merged_groups} 组`, 'success');
+        await loadAuditPanel();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+async function handleCandidate(index, op) {
+    try {
+        await api(`/api/novels/${currentNovelId}/audit/resources/candidate`, {
+            method: 'POST',
+            body: JSON.stringify({ index, action: op }),
+        });
+        toast(op === 'accept' ? '已采纳' : '已忽略', 'success');
+        await loadAuditPanel();
+    } catch (e) { toast(e.message, 'error'); }
 }
 
 async function editResource(category, index) {
@@ -1869,6 +2052,11 @@ const ACTION_HANDLERS = {
     // 审计
     resolveConflict: (el) => resolveConflict(+el.dataset.index, el.dataset.resolution),
     modifyChapterForConflict: (el) => modifyChapterForConflict(+el.dataset.index, +el.dataset.chapter),
+    proposePatch: (el) => proposePatch(+el.dataset.index),
+    applyPatch: () => applyPendingPatch(),
+    showResourceHealth: () => showResourceHealth(),
+    bulkCleanupResources: () => bulkCleanupResources(),
+    handleCandidate: (el) => handleCandidate(+el.dataset.index, el.dataset.op),
     editResource: (el) => editResource(el.dataset.category, +el.dataset.index),
     deleteResource: (el) => deleteResource(el.dataset.category, +el.dataset.index),
     saveResource: (el) => saveResource(el.dataset.category, +el.dataset.index),

@@ -262,65 +262,178 @@ def build_write_continuation_prompt(project: NovelProject, chapter_plan: dict,
 
 
 def build_audit_prompt(project: NovelProject, chapter_content: str,
-                       chapter_number: int, resource_summary: str) -> str:
-    """构建审计提示词"""
-    return f"""你是一个小说审计专家，负责检查小说章节的连贯性和一致性。
+                       chapter_number: int, resource_summary: str,
+                       nearby_characters: str = "", recent_overview: str = "") -> str:
+    """构建审计提示词
 
-# 小说信息
+    P0 关键修复：此前只给 AI「标题 + 资源摘要 + 本章正文」，
+    基础设定 / 人物卡 / 剧情概述一律没带——所以"设定冲突""人物状态冲突"
+    根本无从对照，模型只能凭正文猜，于是产出大量"时间模糊""未提及"这类空话。
+    现在补齐判定依据，并要求给出可执行的段落级改写。
+    """
+    parts = [f"""你是一个小说审稿编辑，负责找出**真正的连贯性错误**，并给出**可直接应用的最小修改**。
+
+# 项目
 {project.title}
+"""]
 
-# 当前资源追踪状态
-{resource_summary}
+    # 判定依据一：基础设定
+    if project.core_prompt.basic_setting:
+        parts.append(
+            "# 基础设定（判定「设定冲突」的依据）\n"
+            f"{project.core_prompt.basic_setting}\n"
+        )
 
-# 待审计章节（第{chapter_number}章）
+    # 判定依据二：人物卡（优先放本章出场者）
+    if nearby_characters:
+        parts.append(
+            "# 相关人物卡（判定「人物状态冲突」的依据）\n"
+            f"{nearby_characters}\n"
+        )
+
+    # 判定依据三：前情概述
+    if recent_overview:
+        parts.append(
+            "# 前情概述（判定「时间线/伏笔」的依据）\n"
+            f"{recent_overview}\n"
+        )
+
+    # 判定依据四：资源表
+    if resource_summary:
+        parts.append(resource_summary)
+
+    parts.append(f"""# 待审计章节（第{chapter_number}章）
 {chapter_content}
+""")
 
-# 审计任务
+    parts.append("""# 审计任务
 
-请仔细检查本章内容，完成以下任务：
+## 一、只报"能被证实"的错误
+逐条核对下列 6 类冲突。**必须有正文原句作为证据**，说不出原句的就不要报：
 
-## 1. 冲突检测
-检查是否存在以下类型的冲突：
-- 时间线冲突：角色在同一时间出现在两个地方？
-- 人物状态冲突：已死/已离开/已转变的角色出现矛盾？
-- 物品冲突：已销毁/已转让的物品再次出现？
-- 设定冲突：与基础设定矛盾的描述？
-- 数值冲突：财富/能力等数值异常变化？
-- 伏笔冲突：已回收的伏笔再次埋设？
+- 时间线冲突：同一角色同时出现在两处；时间倒流；与"前情概述"矛盾的时序
+- 人物状态冲突：已死/已离场/已转变的角色状态与"人物卡"或资源表不符
+- 物品冲突：已销毁/已转让的物品再次出现且未说明来路
+- 设定冲突：违反"基础设定"中的明确规则
+- 数值冲突：财富/能力/积分数值与资源表记录矛盾
+- 伏笔冲突：已回收的伏笔再次被当作未解决
 
-## 2. 资源变动提取
-提取本章中发生的资源变动：
-- 新增/变更的财富或资产
-- 新增/变更/销毁的重要物品
-- 系统数值变化（如有）
-- 人物状态变化
-- 新埋设的伏笔
-- 已回收的伏笔
+**不要报这些**（它们不是错误，是写作建议，最多作为 info）：
+- "某角色未出场/缺席"——除非前情明确要求他必须在本章出现
+- "时间描写不够具体""建议加强描写""可以补充细节"这类泛泛评价
+- 文笔、节奏、篇幅、情感强度方面的主观意见
 
-## 3. 输出格式
-请严格按照以下JSON格式输出：
+## 二、给出可执行修改
+每条冲突必须给出 `anchor`：**原封不动复制本章中需要修改的那一句（或连续几句）**，
+长度不超过 80 字，必须能在正文中精确找到。
+`fix_type` 取值：
+- `replace_text`：只需替换 anchor 这一处文字（最常见）
+- `rewrite_paragraph`：anchor 所在段落需要整体重写，此时必须给出 `suggested_text`
+- `update_resource`：正文没问题，是资源表记错了，无需改文
+- `none`：确实不好定位（尽量避免）
+
+## 三、资源变动提取（重要性把关）
+**只提取会影响后续剧情走向的资源**。下列内容一律不要提取：
+- 一次性的、用后即弃的物品（杯子、纸巾、普通衣物）
+- 数值未变化的日常重复（吃饭、睡觉、上班）
+- 没有专名、没有后续作用的泛称
+- 只有"已获得/已兑换"这类没有具体内容的状态
+
+每条资源必须标注：
+- `importance`：`core`（贯穿主线，如金手指/关键道具/核心人物关系变化）
+  / `normal`（有后续作用）/ `minor`（仅本章提及）
+- `confidence`：0-1，你对"它真的重要且真的发生了"的把握
+
+**命名规则（很重要，直接决定资源表会不会变成流水账）**：
+- `character_status` 的 `name` **只写人物姓名本身**（如"柳冰冰"），
+  绝对不要写"柳冰冰（状态）""柳冰冰心理状态""柳冰冰（新人物状态）"这类带后缀变体；
+  同一人物的身心/身份变化**合并成一条**，在 `value` 里用一段话写清当前综合状态
+- `item` / `foreshadow` 的 `name` 写稳定的专名，不要在名字里塞描述或括注
+- 同一个东西在不同章节**必须复用同一个名字**，否则会被当成新资源
+
+## 四、输出格式
+严格输出以下 JSON，不要输出任何额外文字：
 
 ```json
-{{
+{
   "conflicts": [
-    {{
+    {
       "conflict_type": "timeline/character/item/setting/value/foreshadow",
-      "description": "冲突描述",
-      "suggestion": "建议处理方式"
-    }}
+      "severity": "error/warning/info",
+      "description": "冲突描述（一句话说清哪里不对）",
+      "evidence": "支撑判断的前情依据（来自设定/人物卡/资源表的原文）",
+      "anchor": "本章中需要修改的原句（不超过80字，必须能精确匹配）",
+      "fix_type": "replace_text/rewrite_paragraph/update_resource/none",
+      "suggested_text": "fix_type=rewrite_paragraph 时的改写文本；其它情况留空",
+      "suggestion": "给作者的处理建议"
+    }
   ],
   "resource_changes": [
-    {{
+    {
       "category": "wealth/item/system/character_status/foreshadow",
-      "name": "资源名称",
-      "value": "当前值/状态",
-      "action": "add/update/destroy/resolve"
-    }}
+      "name": "资源名称（写专名，不要写"某物品"）",
+      "value": "当前具体值/状态（写清内容，不要只写"已获得"）",
+      "action": "add/update/destroy/resolve",
+      "importance": "core/normal/minor",
+      "confidence": 0.9,
+      "source_excerpt": "本章中首次提到它的原句（不超过40字）"
+    }
   ],
-  "summary": "本章审计总结"
+  "summary": "本章审计总结（1-2 句）"
+}
+```
+
+判定规则：
+- `severity=error` 仅用于"读者会明显察觉的自相矛盾"
+- `severity=warning` 用于"可能有问题，需要作者确认"
+- `severity=info` 用于"写作建议"
+- 没有冲突就返回空数组，不要为了凑数编造
+""")
+
+    return "\n".join(parts)
+
+
+def build_patch_prompt(chapter_content: str, paragraphs: list[str],
+                       conflict: dict) -> str:
+    """段落级补丁提示词（P0 核心：只改有问题的段落，不重写整章）
+
+    这是"审计建议可直接落地"的关键——此前唯一途径是整章重新生成，
+    改一个词也要付 2 万字的代价，且原稿被覆盖。
+    """
+    para_list = "\n".join(f"[{i}] {p}" for i, p in enumerate(paragraphs))
+    anchor = conflict.get("anchor", "")
+    return f"""你在做小说**局部修订**：只改必要的地方，其余文字一个字都不要动。
+
+# 需要修正的问题
+- 类型：{conflict.get('conflict_type', '')}
+- 严重度：{conflict.get('severity', 'warning')}
+- 问题：{conflict.get('description', '')}
+- 依据：{conflict.get('evidence', '') or '（无）'}
+- 需要修改的原句：{anchor or '（未指定，请自行定位）'}
+- 作者建议：{conflict.get('suggestion', '') or '（无）'}
+
+# 本章段落（编号仅用于定位，不要输出编号）
+{para_list}
+
+# 输出要求
+1. 只输出**需要修改的段落**，用如下 JSON 返回，不要输出其它内容：
+```json
+{{
+  "patches": [
+    {{
+      "paragraph_index": 3,
+      "original": "该段落的原文（用于校验定位是否准确）",
+      "revised": "修改后的整段文字"
+    }}
+  ]
 }}
 ```
-"""
+2. `paragraph_index` 必须来自上面的编号
+3. `original` 必须是该段落原文的**完整内容**（用于精确匹配校验）
+4. 未涉及的段落不要出现在 patches 里；若无需修改则返回空数组
+5. 修改后要自然衔接上下文，不要改变剧情走向，不要增删关键情节
+6. 篇幅与原段落相当（±30% 以内）"""
+
 
 
 def build_import_analysis_prompt(novel_text: str) -> str:
